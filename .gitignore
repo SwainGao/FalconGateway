@@ -1,0 +1,24 @@
+# Credentials
+config.json
+
+# Build
+build/
+
+# Runtime generated
+log/*.log
+flow/
+
+# IDE / tools
+.cache/
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+_deps/
+
+# Compiled artifacts (keep lib/*.so — they're CTP SDK dependencies)
+*.o

@@ -1,0 +1,11 @@
+{
+    "broker_id": "9999",
+    "user_id": "your_user_id",
+    "password": "your_password",
+    "app_id": "simnow_client_test",
+    "auth_code": "0000000000000000",
+    "trade_front": "tcp://182.254.243.31:40001",
+    "market_front": "tcp://182.254.243.31:40011",
+    "flow_path_trade": "./flow/trade/",
+    "flow_path_market": "./flow/market/"
+}
