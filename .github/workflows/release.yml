@@ -6,7 +6,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-and-publish:
@@ -44,23 +43,29 @@ jobs:
           cd staging
           tar czf ../falcon-gateway-linux-x64.tar.gz .
 
-      - name: Write release notes
+      - name: Compute lowercase image name and write release notes
+        id: image
         run: |
-          cat > /tmp/release_notes.md << 'NOTES_EOF'
+          REPO="${{ github.repository }}"
+          REPO_LC="${REPO,,}"
+          echo "name=${REPO_LC}" >> $GITHUB_OUTPUT
+          echo "image=${REPO_LC}" >> $GITHUB_OUTPUT
+
+          cat > /tmp/release_notes.md << NOTES_EOF
           CTP 期货交易网关静态库，支持 4 交易所（SHFE/CZCE/DCE/GFEX）。
 
           ### 使用
-          ```bash
+          \`\`\`bash
           tar xzf falcon-gateway-linux-x64.tar.gz
-          # 在 CMakeLists.txt 中:
+          # CMakeLists.txt:
           #   find_library(FALCON falcon_gateway PATHS <path>/lib)
           #   target_link_libraries(your_app falcon_gateway)
-          ```
+          \`\`\`
 
           ### Docker
-          ```bash
-          docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-          ```
+          \`\`\`bash
+          docker pull ghcr.io/${REPO_LC}:${{ github.ref_name }}
+          \`\`\`
           NOTES_EOF
 
       - name: Publish GitHub Release
@@ -86,5 +91,5 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:${{ github.ref_name }}
+            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest
