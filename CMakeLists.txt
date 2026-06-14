@@ -6,7 +6,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Release with debug info
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -march=native -flto")
+option(FALCON_MARCH_NATIVE "Use -march=native for host CPU optimization" ON)
+if(FALCON_MARCH_NATIVE)
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -march=native -flto")
+else()
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -flto")
+endif()
 set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -Wall -Wextra")
 
 # Include paths
@@ -61,3 +66,39 @@ file(COPY ${CTP_LIB_DIR}/thostmduserapi_se.so DESTINATION ${CMAKE_BINARY_DIR})
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     target_compile_options(falcon_gateway PRIVATE -funroll-loops -fomit-frame-pointer)
 endif()
+
+# ================================================================
+# Install targets — for packaging / distribution
+# ================================================================
+include(GNUInstallDirs)
+
+# FalconGateway static library
+install(TARGETS falcon_gateway logger
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
+# Public headers
+install(DIRECTORY include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/falcon
+    FILES_MATCHING PATTERN "*.h"
+)
+
+# Logger headers
+install(DIRECTORY logger/include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/falcon
+    FILES_MATCHING PATTERN "*.h"
+)
+
+# CTP shared libraries (runtime)
+install(FILES
+    ${CTP_LIB_DIR}/thosttraderapi_se.so
+    ${CTP_LIB_DIR}/thostmduserapi_se.so
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
+# Config template
+install(FILES config.json.example
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/falcon
+    RENAME config.json.example
+)

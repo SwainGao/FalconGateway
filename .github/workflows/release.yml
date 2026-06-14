@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write    # for creating GitHub Release
+      packages: write    # for package attestation
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake g++
+
+      - name: Configure
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DFALCON_MARCH_NATIVE=OFF
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Install (staging)
+        run: cmake --install build --prefix staging
+
+      - name: Create package archive
+        run: |
+          cd staging
+          tar czf ../falcon-gateway-linux-x64.tar.gz .
+
+      - name: Generate checksum
+        run: sha256sum falcon-gateway-linux-x64.tar.gz > falcon-gateway-linux-x64.tar.gz.sha256
+
+      - name: Build attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: falcon-gateway-linux-x64.tar.gz
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "FalconGateway ${{ github.ref_name }}"
+          body: |
+            ## FalconGateway ${{ github.ref_name }}
+
+            CTP 期货交易网关静态库，支持 4 交易所（SHFE/CZCE/DCE/GFEX）。
+
+            ### 包含内容
+            - **libfalcon_gateway.a** — 网关静态库
+            - **liblogger.so** — 异步日志库
+            - **CTP SE SDK** — 上期技术交易/行情 API
+            - **头文件** — 完整 C++ API 头文件
+            - **config.json.example** — 配置模板
+
+            ### 使用方式
+            ```bash
+            tar xzf falcon-gateway-linux-x64.tar.gz
+            # 在 CMakeLists.txt 中:
+            #   find_library(FALCON falcon_gateway PATHS <path>/lib)
+            #   target_link_libraries(your_app falcon_gateway)
+            ```
+          files: |
+            falcon-gateway-linux-x64.tar.gz
+            falcon-gateway-linux-x64.tar.gz.sha256
+          generate_release_notes: true
