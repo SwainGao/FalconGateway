@@ -38,18 +38,19 @@ set(FALCON_WARNINGS -Wall -Wextra $<$<BOOL:${FALCON_WERROR}>:-Werror>)
 set(CTP_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/include/ctp)
 set(CTP_LIB_DIR ${CMAKE_SOURCE_DIR}/lib)
 
-# Import CTP shared libraries
-add_library(ctp_trader SHARED IMPORTED)
-set_target_properties(ctp_trader PROPERTIES
-    IMPORTED_LOCATION ${CTP_LIB_DIR}/thosttraderapi_se.so
-    INTERFACE_INCLUDE_DIRECTORIES ${CTP_INCLUDE_DIR}
-)
+# CTP shared libraries. The SDK .so files have no SONAME and no "lib" prefix:
+# link them by file name (-l:) so binaries record "thosttraderapi_se.so" as
+# NEEDED instead of the absolute build path.
+add_library(ctp_trader INTERFACE)
+target_include_directories(ctp_trader SYSTEM INTERFACE ${CTP_INCLUDE_DIR})
+target_link_directories(ctp_trader INTERFACE ${CTP_LIB_DIR})
+target_link_libraries(ctp_trader INTERFACE -l:thosttraderapi_se.so)
 
-add_library(ctp_md SHARED IMPORTED)
-set_target_properties(ctp_md PROPERTIES
-    IMPORTED_LOCATION ${CTP_LIB_DIR}/thostmduserapi_se.so
-    INTERFACE_INCLUDE_DIRECTORIES ${CTP_INCLUDE_DIR}
-)
+add_library(ctp_md INTERFACE)
+target_include_directories(ctp_md SYSTEM INTERFACE ${CTP_INCLUDE_DIR})
+target_link_directories(ctp_md INTERFACE ${CTP_LIB_DIR})
+target_link_libraries(ctp_md INTERFACE -l:thostmduserapi_se.so)
+list(APPEND CMAKE_BUILD_RPATH ${CTP_LIB_DIR})
 
 # Logger (Quill-based async logger, quill provided as git submodule)
 add_subdirectory(logger)
