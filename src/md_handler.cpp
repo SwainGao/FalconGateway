@@ -1,8 +1,13 @@
 #include "md_handler.h"
 #include "logger.h"
-#include <cstring>
 
 namespace falcon {
+
+void MdHandler::resetState() {
+    front_connected = false;
+    front_disconnected = false;
+    login_success = false;
+}
 
 void MdHandler::OnFrontConnected() {
     front_connected = true;
@@ -10,20 +15,16 @@ void MdHandler::OnFrontConnected() {
 
 void MdHandler::OnFrontDisconnected(int nReason) {
     front_connected = false;
+    front_disconnected = true;
     LOG_WARN("[MdSPI] Disconnected. Reason=0x{:04X}", nReason);
 }
 
-void MdHandler::OnRspUserLogin(CThostFtdcRspUserLoginField* pRspUserLogin,
-                                CThostFtdcRspInfoField* pRspInfo, int nRequestID, bool bIsLast) {
+void MdHandler::OnRspUserLogin(CThostFtdcRspUserLoginField*,
+                               CThostFtdcRspInfoField* pRspInfo, int, bool) {
     if (pRspInfo && pRspInfo->ErrorID == 0) {
         login_success = true;
-        need_relogin_ = true;
     } else if (pRspInfo) {
-        login_success = false;
         LOG_ERROR("[MdSPI] Login failed: {} {}", pRspInfo->ErrorID, pRspInfo->ErrorMsg);
-        if (pRspInfo->ErrorID != 5) {
-            need_relogin_ = false;
-        }
     }
 }
 
@@ -31,9 +32,9 @@ void MdHandler::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField* pData) {
     if (!pData) return;
 
     TickData tick;
-    tick.instrument = pData->InstrumentID;
-    tick.exchange = pData->ExchangeID;
-    tick.update_time = pData->UpdateTime;
+    tick.instrument = ctpString(pData->InstrumentID);
+    tick.exchange = ctpString(pData->ExchangeID);
+    tick.update_time = ctpString(pData->UpdateTime);
     tick.update_millisec = pData->UpdateMillisec;
     tick.last_price = pData->LastPrice;
     tick.bid_price1 = pData->BidPrice1;
@@ -51,19 +52,22 @@ void MdHandler::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField* pData) {
     tick.recv_time = now();
 
     if (!tick_buffer.tryPush(std::move(tick))) {
-        LOG_CRITICAL("[MdSPI] Tick buffer FULL! Dropping {}", pData->InstrumentID);
+        if (dropped_ticks++ % 1000 == 0) {
+            LOG_CRITICAL("[MdSPI] Tick buffer FULL! Dropping {} (dropped={})",
+                         pData->InstrumentID, dropped_ticks.load());
+        }
     }
 }
 
 void MdHandler::OnRspSubMarketData(CThostFtdcSpecificInstrumentField* pSpecificInstrument,
-                                    CThostFtdcRspInfoField* pRspInfo, int nRequestID, bool bIsLast) {
+                                   CThostFtdcRspInfoField* pRspInfo, int, bool) {
     if (pRspInfo && pRspInfo->ErrorID != 0) {
-        LOG_ERROR("[MdSPI] Subscribe failed: {} {}",
-                  pRspInfo->ErrorID, pRspInfo->ErrorMsg);
+        LOG_ERROR("[MdSPI] Subscribe failed: {} {} inst={}", pRspInfo->ErrorID, pRspInfo->ErrorMsg,
+                  (pSpecificInstrument ? pSpecificInstrument->InstrumentID : "?"));
     }
 }
 
-void MdHandler::OnRspError(CThostFtdcRspInfoField* pRspInfo, int nRequestID, bool bIsLast) {
+void MdHandler::OnRspError(CThostFtdcRspInfoField* pRspInfo, int, bool) {
     if (pRspInfo && pRspInfo->ErrorID != 0) {
         LOG_ERROR("[MdSPI] OnRspError: id={} msg={}", pRspInfo->ErrorID, pRspInfo->ErrorMsg);
     }

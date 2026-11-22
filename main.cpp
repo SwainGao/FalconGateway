@@ -1,5 +1,7 @@
 #include <csignal>
 #include <atomic>
+#include <cstring>
+#include <iostream>
 #include <chrono>
 #include <thread>
 #include "gateway.h"
@@ -103,19 +105,64 @@ bool runExchangeTest(TestContext& ctx) {
     return true;
 }
 
-int main() {
+void printUsage(const char* prog) {
+    std::cout << "Usage: " << prog << " [--config PATH] [--run-order-test]\n"
+              << "  --config PATH      config file (default: config.json)\n"
+              << "  --run-order-test   place real test orders on SHFE/CZCE/DCE/GFEX\n"
+              << "                     (default: connect, load state and monitor only)\n";
+}
+
+// Default mode: connect, load state, log it periodically. Never sends orders.
+int runMonitor(falcon::GatewayConfig cfg) {
+    falcon::FalconGateway gw(cfg);
+    gw.setLoginCallback([](bool ok, const std::string& msg) {
+        LOG_INFO("[Main] Login: {} {}", ok ? "OK" : "FAIL", msg);
+    });
+    gw.setErrorCallback([](int id, const std::string& msg) {
+        LOG_ERROR("[Main] Error: {} {}", id, msg);
+    });
+    if (!gw.start()) { LOG_CRITICAL("[Main] Failed to start"); return 1; }
+    waitForReady(gw);
+    int seconds = 0;
+    while (g_running) {
+        if (gw.isReady() && seconds % 60 == 0) gw.verifyLocalState();
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        seconds++;
+    }
+    gw.stop();
+    LOG_INFO("[Main] Done.");
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    std::string config_path = "config.json";
+    bool run_order_test = false;
+    for (int i = 1; i < argc; i++) {
+        if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            config_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--run-order-test") == 0) {
+            run_order_test = true;
+        } else {
+            printUsage(argv[0]);
+            return std::strcmp(argv[i], "--help") == 0 ? 0 : 2;
+        }
+    }
+
     logger::init();
-    LOG_INFO("[Main] ===== FalconGateway 4-Exchange Full Test =====");
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
     falcon::GatewayConfig cfg;
     std::string err_msg;
-    if (!falcon::loadConfigFromFile("config.json", cfg, err_msg)) {
-        LOG_CRITICAL("[Main] Failed to load config: {}", err_msg);
+    if (!falcon::loadConfigFromFile(config_path, cfg, err_msg)) {
+        LOG_CRITICAL("[Main] Failed to load config {}: {}", config_path, err_msg);
         return 1;
     }
-    LOG_INFO("[Main] Config loaded from config.json");
+    LOG_INFO("[Main] Config loaded from {}", config_path);
+
+    if (!run_order_test) return runMonitor(cfg);
+
+    LOG_INFO("[Main] ===== FalconGateway 4-Exchange Full Test =====");
 
     // All 4 exchanges
     TestContext tests[] = {

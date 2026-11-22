@@ -1,10 +1,13 @@
 #pragma once
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <array>
 #include <chrono>
 #include <functional>
+#include <vector>
 
 namespace falcon {
 
@@ -18,22 +21,62 @@ using Timestamp = std::chrono::steady_clock::time_point;
 inline Timestamp now() { return std::chrono::steady_clock::now(); }
 
 // ============================================================
+// Fixed-size char field helpers (CTP structs use char[N])
+// ============================================================
+
+// Copy src into a fixed char array. Returns false (and leaves dst empty)
+// if src does not fit including the terminating NUL.
+template<size_t N>
+[[nodiscard]] inline bool copyField(char (&dst)[N], std::string_view src) {
+    if (src.size() >= N) {
+        dst[0] = '\0';
+        return false;
+    }
+    std::memcpy(dst, src.data(), src.size());
+    dst[src.size()] = '\0';
+    return true;
+}
+
+// Bounded copy from a CTP char[M] field (may lack NUL) into std::array<char, N>.
+template<size_t N, size_t M>
+inline void copyCtpField(std::array<char, N>& dst, const char (&src)[M]) {
+    size_t len = std::min(strnlen(src, M), N - 1);
+    std::memcpy(dst.data(), src, len);
+    dst[len] = '\0';
+}
+
+template<size_t M>
+inline std::string ctpString(const char (&src)[M]) {
+    return std::string(src, strnlen(src, M));
+}
+
+// ============================================================
 // Order
 // ============================================================
 enum class Direction : char { Buy = '0', Sell = '1' };
 enum class Offset : char { Open = '0', Close = '1', CloseToday = '3', CloseYesterday = '4' };
 enum class OrderStatus : char {
-    AllTraded = '0', PartTraded = '1', NoTrade = '3', Canceled = '5', Unknown = 'a'
+    AllTraded = '0',
+    PartTraded = '1',              // PartTradedQueueing
+    PartTradedQueueing = '1',
+    PartTradedNotQueueing = '2',
+    NoTrade = '3',                 // NoTradeQueueing
+    NoTradeQueueing = '3',
+    NoTradeNotQueueing = '4',
+    Canceled = '5',
+    Unknown = 'a',
+    NotTouched = 'b',
+    Touched = 'c'
 };
 enum class OrderType : char { Limit = '0', Market = '1' };
 
 struct OrderRequest {
     std::string instrument;
     std::string exchange;
-    Direction direction;
-    Offset offset;
-    double price;
-    int volume;
+    Direction direction = Direction::Buy;
+    Offset offset = Offset::Open;
+    double price = 0.0;
+    int volume = 0;
     OrderType type = OrderType::Limit;
     char hedge_flag = '1';  // 投机
     int request_id = 0;
@@ -66,7 +109,9 @@ struct OrderRecord {
         return std::string(order_sys_id.data());
     }
     [[nodiscard]] bool isFinal() const {
-        return status == OrderStatus::AllTraded || status == OrderStatus::Canceled;
+        return status == OrderStatus::AllTraded || status == OrderStatus::Canceled
+            || status == OrderStatus::PartTradedNotQueueing
+            || status == OrderStatus::NoTradeNotQueueing;
     }
 };
 
@@ -77,12 +122,19 @@ struct TradeRecord {
     std::array<char, 21> trade_id{};
     std::string instrument;
     std::string exchange;
-    Direction direction;
-    Offset offset;
+    Direction direction = Direction::Buy;
+    Offset offset = Offset::Open;
     double price = 0.0;
     int volume = 0;
     std::array<char, 21> order_sys_id{};
+    std::array<char, 13> order_ref{};
     Timestamp trade_time;
+
+    // TradeID is only unique per exchange and side (self-trades share it)
+    [[nodiscard]] std::string tradeKey() const {
+        return exchange + "|" + std::string(trade_id.data()) + "|"
+             + static_cast<char>(direction);
+    }
 };
 
 // ============================================================
@@ -181,6 +233,7 @@ using ConnectedCallback = std::function<void()>;
 // Instrument Info (合约信息)
 // ============================================================
 struct InstrumentInfo {
+    std::string instrument_id;    // 合约代码
     std::string product_id;       // 品种代码
     std::string exchange_id;      // 交易所代码
     char product_class = '1';     // '1'=期货 '2'=期权 '3'=组合

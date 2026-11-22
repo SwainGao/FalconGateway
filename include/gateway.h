@@ -2,10 +2,12 @@
 #include <thread>
 #include <atomic>
 #include <memory>
-#include <vector>
+#include <mutex>
+#include <set>
 #include <string>
-#include "ctp/ThostFtdcTraderApi.h"
-#include "ctp/ThostFtdcMdApi.h"
+#include <unordered_set>
+#include <vector>
+#include "ctp_api.h"
 #include "trader_handler.h"
 #include "md_handler.h"
 #include "order_manager.h"
@@ -29,6 +31,8 @@ public:
     void stop();     // Cancel all orders + release
 
     // ===== Trading =====
+    // Returns 0 on success, -1 not ready, -2 insufficient funds, -3 invalid
+    // request, -4 duplicate OrderRef, or the ReqOrderInsert error code.
     int sendOrder(const OrderRequest& req);
     int cancelOrder(const std::string& order_ref);
     int cancelOrderBySysID(const std::string& order_sys_id, const std::string& exchange,
@@ -36,10 +40,11 @@ public:
     int cancelAllActive();  // Cancel all pending orders
 
     // ===== Market Data =====
+    // Subscriptions are remembered and restored after a market-data reconnect.
     void subscribe(const std::vector<std::string>& instruments);
     void unsubscribe(const std::vector<std::string>& instruments);
 
-    // ===== Query (async, results via callbacks) =====
+    // ===== Query (async, results update local state) =====
     void queryPosition();
     void queryAccount();
     void queryInstrument(const std::string& product_id = "");
@@ -48,9 +53,11 @@ public:
 
     // ===== Comparison / Verification =====
     void verifyLocalState();   // Dump local state only
-    void compareWithRemote();  // Query CTP and compare local vs remote, log mismatches
+    // Query CTP and compare local vs remote, log mismatches. Blocks until the
+    // queries complete (or timeout_sec elapses).
+    void compareWithRemote(int timeout_sec = 30);
 
-    // ===== Callback Registration =====
+    // ===== Callback Registration (set before start()) =====
     void setTickCallback(TickCallback cb)    { tick_cb_ = std::move(cb); }
     void setOrderCallback(OrderCallback cb)  { order_cb_ = std::move(cb); }
     void setTradeCallback(TradeCallback cb)  { trade_cb_ = std::move(cb); }
@@ -58,14 +65,14 @@ public:
     void setErrorCallback(ErrorCallback cb)  { error_cb_ = std::move(cb); }
     void setConnectedCallback(ConnectedCallback cb) { connected_cb_ = std::move(cb); }
 
-    // ===== Instrument loading =====
-    void onInstrumentResponse(CThostFtdcInstrumentField* pInst, bool bIsLast);
-
     // ===== State =====
     bool isReady() const { return ready_; }
     int frontID() const { return trader_handler_->front_id; }
     int sessionID() const { return trader_handler_->session_id; }
-    std::string tradingDay() const { return trader_handler_->trading_day; }
+    std::string tradingDay() const { return trader_handler_->tradingDay(); }
+    AccountRecord getAccount() const { return position_mgr_.getAccount(); }
+    std::vector<OrderRecord> activeOrders() const { return order_mgr_.activeOrders(); }
+    std::vector<TradeRecord> tradeHistory() const;
 
 private:
     GatewayConfig config_;
@@ -78,31 +85,33 @@ private:
     std::unique_ptr<TraderHandler> trader_handler_;
     std::unique_ptr<MdHandler> md_handler_;
 
-    // Managers (accessed from worker thread only)
     OrderManager order_mgr_;
     PositionManager position_mgr_;
     FlowController flow_ctrl_;
 
     // Worker threads
-    std::unique_ptr<std::thread> trade_worker_;
-    std::unique_ptr<std::thread> md_worker_;
+    std::thread trade_worker_;
+    std::thread md_worker_;
     std::atomic<bool> running_{false};
     std::atomic<bool> ready_{false};
 
-    // Init state tracking
-    std::atomic<bool> settlement_confirmed_{false};
-    std::atomic<bool> positions_loaded_{false};
-    std::atomic<bool> account_loaded_{false};
-    std::atomic<bool> instruments_loaded_{false};
-    int instrument_count_ = 0;
-    int instruments_loaded_count_ = 0;
+    // Set by a FlowController marker once all startup queries have completed
+    std::atomic<bool> startup_done_{false};
+    std::atomic<int> instruments_loaded_count_{0};
+    std::atomic<int> instrument_count_{0};
+    bool login_fail_reported_ = false;   // trade worker only
+    std::string history_trading_day_;    // trade worker only
 
-    // Remote query result storage (for comparison/verification)
-    std::vector<OrderRecord> remote_orders_;
-    std::vector<TradeRecord> remote_trades_;
+    // Serializes OrderRef allocation + ReqOrderInsert (CTP needs increasing refs)
+    std::mutex send_mtx_;
 
-    // Local trade history (persistent across session, loaded from CTP at startup)
+    // Trade history of the current trading day, de-duplicated by trade key
+    mutable std::mutex history_mtx_;
     std::vector<TradeRecord> trade_history_;
+    std::unordered_set<std::string> seen_trades_;
+
+    std::mutex sub_mtx_;
+    std::set<std::string> subscribed_;
 
     // Callbacks
     TickCallback tick_cb_;
@@ -113,21 +122,28 @@ private:
     ConnectedCallback connected_cb_;
 
     // ===== Internal Methods =====
+    bool validateConfig() const;
     void tradeWorkerLoop();
     void mdWorkerLoop();
 
-    // Process ring buffer events
     void processOrderUpdate(const OrderRecord& rec);
     void processTradeUpdate(const TradeRecord& rec);
-    void processPositionResult(const PositionRecord& rec);
-    void processAccountResult(const AccountRecord& rec);
+    bool recordTrade(const TradeRecord& rec);
     void processTick(const TickData& tick);
+    void onInstrumentResponse(const InstrumentInfo* info, bool is_last);
+    int cancelOrderRecord(const OrderRecord& ord);
 
-    // Init sequence (chained callbacks via flow controller)
+    // Queries go through the flow controller; verify=true routes the
+    // responses to the comparison buffers.
+    void submitQuery(const char* name, std::function<int(int)> req, bool verify = false);
+    void submitPositionQuery(bool verify, bool replace_snapshot);
+    void submitAccountQuery(bool verify);
+    void submitOrderQuery(bool verify);
+    void submitTradeQuery(bool verify);
+
     void onLoginSuccess();
-    void confirmSettlement();
-    void startQueries();
-    void checkReady();
+    void onReady();
+    void reconcileCommission();
 };
 
 } // namespace falcon

@@ -1,102 +1,130 @@
 #include "order_manager.h"
-#include <cstring>
-#include <algorithm>
 
 namespace falcon {
 
-std::string OrderManager::makeOrderRef() {
-    std::lock_guard lock(mtx_);
-    return std::to_string(++order_ref_counter_);
+std::string OrderManager::makeKey(int front_id, int session_id, std::string_view order_ref) {
+    std::string key = std::to_string(front_id) + "_" + std::to_string(session_id) + "_";
+    key.append(order_ref.data(), strnlen(order_ref.data(), order_ref.size()));
+    return key;
 }
 
-OrderRecord* OrderManager::create(const OrderRequest& req, int front_id, int session_id, const std::string& order_ref) {
-    std::lock_guard lock(mtx_);
+std::string OrderManager::sysKey(std::string_view exchange, std::string_view sys_id) {
+    std::string key(exchange);
+    key += '|';
+    key += sys_id;
+    return key;
+}
 
+bool OrderManager::create(const OrderRequest& req, int front_id, int session_id,
+                          const std::string& order_ref) {
     OrderRecord rec;
     rec.request = req;
     rec.front_id = front_id;
     rec.session_id = session_id;
-    std::copy(order_ref.begin(), order_ref.end(), rec.order_ref.begin());
+    size_t len = std::min(order_ref.size(), rec.order_ref.size() - 1);
+    std::copy_n(order_ref.begin(), len, rec.order_ref.begin());
+    rec.volume_total = req.volume;
     rec.create_time = now();
     rec.update_time = rec.create_time;
     rec.is_local = true;
 
-    auto key = rec.orderKey();
-    // Trim trailing nulls for lookup key
-    auto pos = key.find('\0');
-    if (pos != std::string::npos) key.resize(pos);
-
-    auto [it, ok] = storage_.emplace(key, std::move(rec));
-    pending_[key] = it->second;
-    return &it->second;
+    auto key = makeKey(front_id, session_id, rec.order_ref.data());
+    std::lock_guard lock(mtx_);
+    return storage_.emplace(std::move(key), std::move(rec)).second;
 }
 
-OrderManager::UpdateResult OrderManager::update(
-    int front_id, int session_id,
-    const std::string& order_ref,
-    const std::string& order_sys_id,
-    char order_status, char submit_status,
-    int volume_traded, int volume_total,
-    const std::string& /*status_msg*/)
-{
+bool OrderManager::remove(const std::string& key) {
     std::lock_guard lock(mtx_);
-    UpdateResult result{};
+    auto it = storage_.find(key);
+    if (it == storage_.end()) return false;
+    if (it->second.order_sys_id[0] != '\0') {
+        exchange_lookup_.erase(sysKey(it->second.request.exchange, it->second.order_sys_id.data()));
+    }
+    storage_.erase(it);
+    return true;
+}
 
-    // Find by order_ref key first
-    std::string ref_key = std::to_string(front_id) + "_" + std::to_string(session_id) + "_" + order_ref;
-    auto it = storage_.find(ref_key);
+OrderManager::UpdateResult OrderManager::update(const OrderRecord& rtn) {
+    UpdateResult result;
+    std::string sys_id(rtn.order_sys_id.data());
 
-    // If not found, try lookup by order_sys_id
-    if (it == storage_.end() && !order_sys_id.empty()) {
-        auto sys_it = exchange_lookup_.find(order_sys_id);
+    std::lock_guard lock(mtx_);
+    auto key = makeKey(rtn.front_id, rtn.session_id, rtn.order_ref.data());
+    auto it = storage_.find(key);
+    if (it == storage_.end() && !sys_id.empty()) {
+        auto sys_it = exchange_lookup_.find(sysKey(rtn.request.exchange, sys_id));
         if (sys_it != exchange_lookup_.end()) {
-            ref_key = sys_it->second->orderKey();
-            auto pos = ref_key.find('\0');
-            if (pos != std::string::npos) ref_key.resize(pos);
-            it = storage_.find(ref_key);
+            key = sys_it->second;
+            it = storage_.find(key);
         }
     }
+    if (it == storage_.end()) return result;  // external order (other session)
 
-    if (it == storage_.end()) {
-        // External order (from another session) — create placeholder
-        // For now, skip
+    auto& ord = it->second;
+    result.found = true;
+    result.key = key;
+
+    // Final states are terminal; fill counts never go backwards. This makes
+    // replays (THOST_TERT_RESTART) and duplicate pushes harmless.
+    if (ord.isFinal() || rtn.volume_traded < ord.volume_traded) {
+        result.ignored = true;
+        result.record = ord;
         return result;
     }
 
-    auto& ord = it->second;
     ord.update_time = now();
-    ord.status = static_cast<OrderStatus>(order_status);
-    ord.submit_status = submit_status;
-    ord.volume_traded = volume_traded;
-    ord.volume_total = volume_total;
+    ord.status = rtn.status;
+    ord.submit_status = rtn.submit_status;
+    ord.volume_traded = rtn.volume_traded;
+    ord.volume_total = rtn.volume_total;
 
-    // Register in exchange lookup on first sys_id
-    if (!order_sys_id.empty() && ord.order_sys_id[0] == '\0') {
-        std::copy(order_sys_id.begin(), order_sys_id.end(), ord.order_sys_id.begin());
-        exchange_lookup_[order_sys_id] = &ord;
+    if (!sys_id.empty() && ord.order_sys_id[0] == '\0') {
+        ord.order_sys_id = rtn.order_sys_id;
+        exchange_lookup_[sysKey(ord.request.exchange, sys_id)] = key;
     }
 
-    result.record = &ord;
-
-    if (ord.isFinal()) {
-        result.newly_final = true;
-        result.is_cancel = (order_status == '5');
-        result.is_exchange_reject = (submit_status == '4');
-    }
-
+    result.newly_final = ord.isFinal();
+    result.record = ord;
     return result;
 }
 
-OrderRecord* OrderManager::findByOrderRef(const std::string& key) {
+std::optional<OrderRecord> OrderManager::findByKey(const std::string& key) const {
     std::lock_guard lock(mtx_);
     auto it = storage_.find(key);
-    return it != storage_.end() ? &it->second : nullptr;
+    if (it == storage_.end()) return std::nullopt;
+    return it->second;
 }
 
-OrderRecord* OrderManager::findByOrderSysID(const std::string& sys_id) {
+std::optional<std::string> OrderManager::keyByOrderSysID(const std::string& exchange,
+                                                         const std::string& sys_id) const {
     std::lock_guard lock(mtx_);
-    auto it = exchange_lookup_.find(sys_id);
-    return it != exchange_lookup_.end() ? it->second : nullptr;
+    auto it = exchange_lookup_.find(sysKey(exchange, sys_id));
+    if (it == exchange_lookup_.end()) return std::nullopt;
+    return it->second;
+}
+
+std::optional<OrderRecord> OrderManager::findByOrderSysID(const std::string& exchange,
+                                                          const std::string& sys_id) const {
+    std::lock_guard lock(mtx_);
+    auto it = exchange_lookup_.find(sysKey(exchange, sys_id));
+    if (it == exchange_lookup_.end()) return std::nullopt;
+    auto ord = storage_.find(it->second);
+    if (ord == storage_.end()) return std::nullopt;
+    return ord->second;
+}
+
+std::vector<OrderRecord> OrderManager::activeOrders() const {
+    std::lock_guard lock(mtx_);
+    std::vector<OrderRecord> out;
+    for (const auto& [k, v] : storage_) {
+        if (!v.isFinal()) out.push_back(v);
+    }
+    return out;
+}
+
+size_t OrderManager::size() const {
+    std::lock_guard lock(mtx_);
+    return storage_.size();
 }
 
 } // namespace falcon

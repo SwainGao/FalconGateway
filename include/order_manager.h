@@ -1,62 +1,48 @@
 #pragma once
-#include <unordered_map>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
-#include <mutex>
+#include <unordered_map>
+#include <vector>
 #include "types.h"
 
 namespace falcon {
 
-// Tracks all orders by their unique keys.
-// Thread-safe: single writer (worker thread), concurrent readers OK with shared_lock.
+// Tracks orders sent by this gateway by "FrontID_SessionID_OrderRef" and by
+// "ExchangeID|OrderSysID". Thread-safe; all accessors return copies.
 class OrderManager {
-    // Phase 1 key: "FrontID_SessionID_OrderRef" (before exchange accepts)
-    std::unordered_map<std::string, OrderRecord> pending_;
-
-    // Phase 2 key: "OrderSysID" (after exchange assigns sys_id)
-    std::unordered_map<std::string, OrderRecord*> exchange_lookup_;
-
-    // Raw storage for stable pointers
     std::unordered_map<std::string, OrderRecord> storage_;
+    std::unordered_map<std::string, std::string> exchange_lookup_;  // sys key -> order key
+    mutable std::mutex mtx_;
 
-    mutable std::recursive_mutex mtx_;
-
-    int order_ref_counter_ = 1000;
-    std::string makeOrderRef();
+    static std::string sysKey(std::string_view exchange, std::string_view sys_id);
 
 public:
-    // Create new order on ReqOrderInsert
-    OrderRecord* create(const OrderRequest& req, int front_id, int session_id, const std::string& order_ref);
+    static std::string makeKey(int front_id, int session_id, std::string_view order_ref);
 
-    // Update order on OnRtnOrder callback
-    // Returns the updated record and whether it became final
+    // Register a new order before ReqOrderInsert. Returns false if the key exists.
+    bool create(const OrderRequest& req, int front_id, int session_id, const std::string& order_ref);
+
+    // Remove an order that never reached CTP (ReqOrderInsert returned non-zero).
+    bool remove(const std::string& key);
+
     struct UpdateResult {
-        OrderRecord* record;
-        bool newly_final = false;    // 刚变为终态
-        bool is_cancel = false;       // 是撤单
-        bool is_exchange_reject = false; // 交易所拒单
+        bool found = false;          // order belongs to this gateway
+        bool ignored = false;        // stale/duplicate update (order already final or older fill count)
+        bool newly_final = false;    // this update moved the order into a final state
+        std::string key;
+        OrderRecord record;          // state after the update
     };
-    UpdateResult update(int front_id, int session_id,
-                        const std::string& order_ref,
-                        const std::string& order_sys_id,
-                        char order_status, char submit_status,
-                        int volume_traded, int volume_total,
-                        const std::string& status_msg);
+    // Apply an OnRtnOrder / OnRspOrderInsert(error) / OnRspQryOrder update.
+    UpdateResult update(const OrderRecord& rtn);
 
-    // Lookup
-    OrderRecord* findByOrderRef(const std::string& key);
-    OrderRecord* findByOrderSysID(const std::string& sys_id);
+    std::optional<OrderRecord> findByKey(const std::string& key) const;
+    std::optional<OrderRecord> findByOrderSysID(const std::string& exchange, const std::string& sys_id) const;
+    std::optional<std::string> keyByOrderSysID(const std::string& exchange, const std::string& sys_id) const;
 
-    // Traverse all active (non-final) orders
-    template<typename F>
-    void forEachActive(F&& fn) {
-        std::lock_guard lock(mtx_);
-        for (auto& [k, v] : storage_) {
-            if (!v.isFinal()) fn(v);
-        }
-    }
-
-    std::string nextOrderRef();
+    std::vector<OrderRecord> activeOrders() const;
+    size_t size() const;
 };
 
 } // namespace falcon

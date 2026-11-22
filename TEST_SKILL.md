@@ -36,7 +36,7 @@ CTP SPI 回调 → RingBuffer(lock-free SPSC) → Worker线程 → 更新本地�
 
 ### 2. 死锁：锁顺序
 **现象**：主线程 `sendOrder` 先锁 pos_mgr 再锁 order_mgr，worker 线程 `processOrderUpdate` 先锁 order_mgr 再锁 pos_mgr → AB/BA  
-**解决**：order_mgr 和 position_mgr 均改用 `std::recursive_mutex`
+**解决**：两个管理器的锁不再嵌套（OrderManager 返回副本后释放锁，再调用 PositionManager），均使用普通 `std::mutex`
 
 ### 3. Available 公式错误
 **错误公式**：`Available = Balance + PositionProfit + CloseProfit - Margin - ...`（PositionProfit/CloseProfit 已在 Balance 中，重复加了）  
@@ -56,7 +56,7 @@ Balance   = PreBalance + Deposit - Withdraw + PositionProfit + CloseProfit - Com
 
 ### 6. 空仓时 positions_loaded 不触发
 **问题**：空仓回调 `pInvestorPosition=NULL, bIsLast=true`，无数据推入 ring buffer  
-**解决**：`startQueries` 后增加延时线程标记就绪
+**解决**：启动查询序列末尾提交 FlowController marker，所有查询收到 `bIsLast`（空仓时也会有一次空回调）或超时后才标记就绪
 
 ### 7. MarginPriceType 偏差
 **问题**：默认假设 `'1'`（昨结算价），SimNow 实际用 `'4'`（开仓价），冻结偏差 ~265 元  
@@ -64,7 +64,7 @@ Balance   = PreBalance + Deposit - Withdraw + PositionProfit + CloseProfit - Com
 
 ### 8. 开仓冻结/释放价差残留
 **问题**：MarginPriceType='4' 时冻结用订单价（`req.price`），成交释放用成交价（`trade.price`），价差不一致 → `frozen_margin` 残留  
-**解决**：成交后将该持仓的 `pos.frozen_margin` 全部清零（`fmg_cleanup`）
+**解决**：冻结按订单记账，成交按该订单冻结量比例释放，残差随订单终态一起释放，不影响同合约其他挂单
 
 ### 9. 保证金占用不按 MarginPriceType 更新
 **问题**：`calcMargin` 直接使用调用者传入价格，不考虑 `broker_margin_price_type_`。开仓成交传 settle_px→trade.price，平仓释放用平仓价重算，tick 时不更新保证金  

@@ -1,14 +1,17 @@
 #include "config_loader.h"
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
-#include <cstring>
+#include <nlohmann/json.hpp>
 
 namespace falcon {
 
-// Minimal flat-JSON parser — no external dependencies
-// Handles a single-level JSON object with string values only
-static std::string readFile(const std::string& path) {
+namespace {
+
+using nlohmann::json;
+
+std::string readFile(const std::string& path) {
     std::ifstream f(path);
     if (!f) throw std::runtime_error("Cannot open config file: " + path);
     std::ostringstream ss;
@@ -16,65 +19,61 @@ static std::string readFile(const std::string& path) {
     return ss.str();
 }
 
-static std::string unescapeJson(const std::string& s) {
-    // Minimal unescape: only handles the subset we need
-    return s;  // config values don't contain escape sequences
+void readString(const json& j, const char* key, std::string& out) {
+    auto it = j.find(key);
+    if (it == j.end()) return;
+    if (!it->is_string()) throw std::runtime_error(std::string("\"") + key + "\" must be a string");
+    out = it->get<std::string>();
 }
 
-static void skipWhitespace(const char*& p) {
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
-}
-
-static std::string parseString(const char*& p) {
-    if (*p != '"') throw std::runtime_error("Expected '\"'");
-    ++p;
-    const char* start = p;
-    while (*p && *p != '"') {
-        if (*p == '\\') ++p;  // skip escaped char
-        if (*p) ++p;
+void readStringList(const json& j, const char* key, std::vector<std::string>& out) {
+    auto it = j.find(key);
+    if (it == j.end()) return;
+    if (!it->is_array()) throw std::runtime_error(std::string("\"") + key + "\" must be an array of strings");
+    out.clear();
+    for (const auto& v : *it) {
+        if (!v.is_string()) throw std::runtime_error(std::string("\"") + key + "\" must be an array of strings");
+        out.push_back(v.get<std::string>());
     }
-    std::string val(start, p - start);
-    if (*p == '"') ++p;
-    return val;
 }
 
-static void parseObject(const char*& p, GatewayConfig& cfg) {
-    skipWhitespace(p);
-    if (*p != '{') throw std::runtime_error("Expected '{'");
-    ++p;
+void readEnv(const char* name, std::string& out) {
+    if (const char* v = std::getenv(name); v && *v) out = v;
+}
 
-    while (*p) {
-        skipWhitespace(p);
-        if (*p == '}') { ++p; return; }
-        if (*p == ',') { ++p; skipWhitespace(p); }
+} // namespace
 
-        std::string key = parseString(p);
-        skipWhitespace(p);
-        if (*p != ':') throw std::runtime_error("Expected ':' after key \"" + key + "\"");
-        ++p;
-        skipWhitespace(p);
-        std::string val = parseString(p);
-
-        // Map JSON keys to struct fields
-        if (key == "broker_id")           cfg.broker_id = val;
-        else if (key == "user_id")        cfg.user_id = val;
-        else if (key == "password")       cfg.password = val;
-        else if (key == "app_id")         cfg.app_id = val;
-        else if (key == "auth_code")      cfg.auth_code = val;
-        else if (key == "trade_front")    cfg.trade_front = val;
-        else if (key == "market_front")   cfg.market_front = val;
-        else if (key == "flow_path_trade")  cfg.flow_path_trade = val;
-        else if (key == "flow_path_market") cfg.flow_path_market = val;
-        // unknown keys are silently ignored (forward compatibility)
+void parseConfig(const std::string& content, GatewayConfig& cfg) {
+    json j;
+    try {
+        j = json::parse(content);
+    } catch (const json::parse_error& e) {
+        throw std::runtime_error(std::string("Invalid JSON: ") + e.what());
     }
+    if (!j.is_object()) throw std::runtime_error("Config root must be a JSON object");
+
+    readString(j, "broker_id", cfg.broker_id);
+    readString(j, "user_id", cfg.user_id);
+    readString(j, "password", cfg.password);
+    readString(j, "app_id", cfg.app_id);
+    readString(j, "auth_code", cfg.auth_code);
+    readString(j, "trade_front", cfg.trade_front);
+    readString(j, "market_front", cfg.market_front);
+    readString(j, "flow_path_trade", cfg.flow_path_trade);
+    readString(j, "flow_path_market", cfg.flow_path_market);
+    readString(j, "product_filter", cfg.product_filter);
+    readStringList(j, "subscribe_list", cfg.subscribe_list);
+    // unknown keys are ignored (forward compatibility)
+
+    // Secrets can be kept out of the file
+    readEnv("FALCON_USER_ID", cfg.user_id);
+    readEnv("FALCON_PASSWORD", cfg.password);
+    readEnv("FALCON_AUTH_CODE", cfg.auth_code);
 }
 
 bool loadConfigFromFile(const std::string& path, GatewayConfig& cfg, std::string& err_msg) {
     try {
-        std::string content = readFile(path);
-        const char* p = content.c_str();
-        skipWhitespace(p);
-        parseObject(p, cfg);
+        parseConfig(readFile(path), cfg);
         return true;
     } catch (const std::exception& e) {
         err_msg = e.what();
