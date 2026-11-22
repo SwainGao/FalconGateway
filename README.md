@@ -20,10 +20,10 @@ FalconGateway      ← 主控网关（生命周期、查询、验证）
     │
 ├── TraderHandler  ← 交易 SPI（CTP线程 → RingBuffer → 工作线程）
 ├── MdHandler      ← 行情 SPI（Tick → RingBuffer → 工作线程）
-├── OrderManager   ← 订单生命周期（三组序号：OrderRef/OrderSysID 双索引）
-├── PositionManager← 持仓+资金（递归锁安全，公式化 Balance）
-├── FlowController ← 查询流控（序列化，防 CTP -2/-3 错误）
-└── RingBuffer     ← Lock-free SPSC 队列（65536 容量）
+├── OrderManager   ← 订单生命周期（OrderRef/OrderSysID 双索引，终态去重）
+├── PositionManager← 持仓+资金（按订单冻结记账，公式化 Balance）
+├── FlowController ← 查询流控（独立线程，按 RequestID 完成/超时/重试）
+└── RingBuffer     ← Lock-free SPSC 队列（报单/成交同一队列保序，交易事件不丢弃）
 ```
 
 ## 构建
@@ -31,15 +31,22 @@ FalconGateway      ← 主控网关（生命周期、查询、验证）
 ```bash
 # 前置要求: CMake 3.24+, C++17, Linux x86_64
 
-cd Falcon_gateway
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release -G "Unix Makefiles"
-make -j4
+git submodule update --init --recursive   # quill + nlohmann/json
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j4
 ```
+
+| CMake 选项 | 默认 | 说明 |
+|------------|------|------|
+| `FALCON_MARCH_NATIVE` | OFF | `-march=native`，产物不可跨 CPU 分发 |
+| `FALCON_ENABLE_LTO` | ON | Release 启用 LTO（开启 sanitizer 时自动关闭） |
+| `FALCON_WERROR` | OFF | 告警视为错误（CI 开启） |
+| `FALCON_BUILD_TESTS` | OFF | 构建 GoogleTest 单元测试（未安装 libgtest-dev 时自动下载） |
+| `FALCON_SANITIZER` | 空 | `address,undefined` 或 `thread` |
 
 产出：
 - `libfalcon_gateway.a` — 静态库
-- `falcon_main` — 示例/测试入口
+- `falcon_main` — 示例入口（默认只连接并监控，不下单）
 - `liblogger.so` — 异步日志库
 
 ## 快速开始
@@ -97,7 +104,7 @@ int main() {
 
 ## 启动加载序列
 
-网关启动后自动链式查询 6 类数据（通过 FlowController 序列化）：
+登录成功后先确认结算单，再链式查询 6 类数据（通过 FlowController 序列化）。全部查询收到 `bIsLast`（或出错/超时）且结果被工作线程处理完后，网关才进入 READY；断线重连后会重新执行整个序列。
 
 | 步骤 | 查询 | 说明 |
 |------|------|------|
@@ -139,9 +146,11 @@ FrontID + SessionID + OrderRef  → 初始定位（CTP 接受前）
 ExchangeID + OrderSysID          → 后续追踪（交易所分配后）
 ```
 
+冻结按订单记账：下单时记录该订单冻结的保证金、手续费和平仓手数（SHFE/INE 按平今/平昨落到对应日期分桶），成交、撤单、拒单只按比例释放该订单自己的冻结。重复或过期的回报（如 `THOST_TERT_RESTART` 重放）不会重复释放。
+
 ### 成交(Trade)
 
-实时成交自动加入 `trade_history_`，启动时从 CTP 查询历史成交去重合并。通过成交历史反算佣金基线：
+实时成交自动加入 `trade_history_`，启动时从 CTP 查询历史成交去重合并（按 交易所+TradeID+方向 去重，重放的成交不会重复计入持仓）。通过成交历史反算佣金基线：
 
 ```
 commission_baseline = SUM(trade.price × trade.volume × multiplier × commission_rate)
@@ -161,11 +170,27 @@ commission_baseline = SUM(trade.price × trade.volume × multiplier × commissio
 | API 动态库 | 同一时间 1 个在途查询，每秒 N 次 | FlowController 序列化 |
 | CTP 后台 | 报撤单 InvestorID 级别，FTD 报文 Session 级别 | 文档说明 |
 
+## 配置
+
+`config.json`（参考 `config.json.example`）：除 `subscribe_list`（字符串数组）外均为字符串字段。`FALCON_USER_ID`、`FALCON_PASSWORD`、`FALCON_AUTH_CODE` 环境变量优先于文件内容，便于不把密码写进文件。
+
 ## 测试
 
+单元测试（不需要 CTP 连接）：
+
 ```bash
-./falcon_main
+cmake -B build -DFALCON_BUILD_TESTS=ON && cmake --build build -j4
+ctest --test-dir build --output-on-failure
 ```
+
+实盘/仿真四所测试（会真实下单）：
+
+```bash
+./falcon_main --config config.json                    # 默认：只连接、加载状态并定期打印
+./falcon_main --config config.json --run-order-test   # 四所下单/撤单/平仓测试
+```
+
+Docker 镜像入口为 `falcon_main --config /config/config.json`，需要挂载配置文件。
 
 测试场景：
 1. **跌停价挂单**：验证冻结 → 撤单 → 释放完整链路
@@ -216,3 +241,7 @@ Falcon_gateway/
     ├── include/logger.h
     └── src/logger.cpp
 ```
+
+## CTP SDK 授权
+
+`lib/` 与 `include/ctp/` 中的 CTP API 来自上海期货信息技术有限公司。本仓库公开分发这些文件前，请确认 SDK 授权允许再分发。

@@ -10,12 +10,23 @@ namespace falcon {
 // ============================================================
 void PositionManager::addInstrument(const InstrumentInfo& info) {
     std::lock_guard lock(mtx_);
-    instruments_[info.product_id] = info;
+    instruments_[info.instrument_id] = info;
 }
 
 void PositionManager::setCommission(const std::string& key, const CommissionInfo& comm) {
     std::lock_guard lock(mtx_);
     commissions_[key] = comm;
+}
+
+void PositionManager::setBrokerMarginPriceType(char t) {
+    std::lock_guard lock(mtx_);
+    broker_margin_price_type_ = t;
+}
+
+void PositionManager::setCommissionBaseline(double comm) {
+    std::lock_guard lock(mtx_);
+    account_.commission = comm;
+    recalcAccount();
 }
 
 void PositionManager::setPreSettlement(const std::string& inst_id, double px) {
@@ -28,18 +39,26 @@ void PositionManager::updateLastPrice(const std::string& inst_id, double px) {
     last_price_[inst_id] = px;
 }
 
-const InstrumentInfo* PositionManager::getInstrument(const std::string& id) const {
+std::optional<InstrumentInfo> PositionManager::getInstrument(const std::string& id) const {
     std::lock_guard lock(mtx_);
     auto it = instruments_.find(id);
-    return it != instruments_.end() ? &it->second : nullptr;
+    if (it == instruments_.end()) return std::nullopt;
+    return it->second;
+}
+
+void PositionManager::recalcAccount() {
+    account_.balance = account_.pre_balance + account_.deposit - account_.withdraw
+                     + account_.position_profit + account_.close_profit - account_.commission;
+    account_.available = account_.balance - account_.curr_margin - account_.frozen_margin
+                       - account_.frozen_commission - account_.frozen_cash
+                       - account_.delivery_margin - account_.reserve;
 }
 
 // ============================================================
 // Margin Calculation
 // ============================================================
 
-double PositionManager::getMarginPrice(const InstrumentInfo& inst, const std::string& inst_id,
-                                        bool isYesterday) const {
+double PositionManager::getMarginPrice(const std::string& inst_id, bool isYesterday) const {
     // Yesterday positions (昨仓) always use PreSettlementPrice
     if (isYesterday) {
         auto it = pre_settlement_.find(inst_id);
@@ -87,7 +106,7 @@ double PositionManager::calcOptionsMargin(const InstrumentInfo& inst, double pri
         // For SHFE: max(昨收盘, 昨结算) × 合约乘数
         // Simplified: use pre_settlement as昨结算
         double settle = 0.0;
-        auto it = pre_settlement_.find(inst.product_id);
+        auto it = pre_settlement_.find(inst.instrument_id);
         if (it != pre_settlement_.end()) settle = it->second;
         premium = settle * inst.volume_multiple;
         if (inst.isSHFE() || inst.isINE()) {
@@ -104,9 +123,8 @@ double PositionManager::calcOptionsMargin(const InstrumentInfo& inst, double pri
     return std::max(premium + fixed, mini) * static_cast<double>(vol);
 }
 
-double PositionManager::calcMargin(const std::string& inst_id, double price,
-                                    int vol, char direction, bool isYesterday) const {
-    // NOTE: caller holds mtx_
+double PositionManager::calcMarginLocked(const std::string& inst_id, double price,
+                                          int vol, char direction, bool isYesterday) const {
     auto it = instruments_.find(inst_id);
     if (it == instruments_.end()) {
         return 0.0;
@@ -120,10 +138,10 @@ double PositionManager::calcMargin(const std::string& inst_id, double price,
     double effective_price = price;
     if (!inst.isOption()) {
         if (isYesterday) {
-            double settle_px = getMarginPrice(inst, inst_id, true);
+            double settle_px = getMarginPrice(inst_id, true);
             if (settle_px > 0) effective_price = settle_px;
         } else if (broker_margin_price_type_ == '1' || broker_margin_price_type_ == '2') {
-            double type_px = getMarginPrice(inst, inst_id, false);
+            double type_px = getMarginPrice(inst_id, false);
             if (type_px > 0) effective_price = type_px;
         }
         // type '3' (成交均价) / '4' (开仓价): keep caller's price
@@ -135,16 +153,39 @@ double PositionManager::calcMargin(const std::string& inst_id, double price,
     return calcFuturesMargin(inst, effective_price, vol, direction);
 }
 
+double PositionManager::calcMargin(const std::string& inst_id, double price,
+                                    int vol, char direction, bool isYesterday) const {
+    std::lock_guard lock(mtx_);
+    return calcMarginLocked(inst_id, price, vol, direction, isYesterday);
+}
+
 // ============================================================
 // Commission Calculation
 // ============================================================
 
+const CommissionInfo* PositionManager::findCommission(const std::string& inst_id) const {
+    auto it = commissions_.find(inst_id);
+    if (it != commissions_.end()) return &it->second;
+    // Brokers may return rates per product (e.g. "rb") instead of per instrument
+    auto inst_it = instruments_.find(inst_id);
+    if (inst_it != instruments_.end() && !inst_it->second.product_id.empty()) {
+        it = commissions_.find(inst_it->second.product_id);
+        if (it != commissions_.end()) return &it->second;
+    }
+    return nullptr;
+}
+
 double PositionManager::calcCommissionForOrder(const std::string& inst_id, double price,
                                                 int vol, bool isOpen, bool isCloseToday) const {
-    // NOTE: caller holds mtx_
-    auto it = commissions_.find(inst_id);
-    if (it == commissions_.end()) return 0.0;
-    const auto& c = it->second;
+    std::lock_guard lock(mtx_);
+    return calcCommissionLocked(inst_id, price, vol, isOpen, isCloseToday);
+}
+
+double PositionManager::calcCommissionLocked(const std::string& inst_id, double price,
+                                              int vol, bool isOpen, bool isCloseToday) const {
+    const CommissionInfo* cp = findCommission(inst_id);
+    if (!cp) return 0.0;
+    const auto& c = *cp;
     auto inst_it = instruments_.find(inst_id);
     double mult = (inst_it != instruments_.end()) ? inst_it->second.volume_multiple : 1.0;
 
@@ -166,16 +207,37 @@ double PositionManager::calcCommissionForOrder(const std::string& inst_id, doubl
     return amount * ratio_by_money + static_cast<double>(vol) * ratio_by_vol;
 }
 
+// Position date buckets consumed by a close, in order.
+//   SHFE/INE: CloseToday → 今仓; CloseYesterday/Close → 昨仓 (exchange treats 平仓 as 平昨)
+//   Others:   先开先平, 优先平昨 (normally only the '1' bucket exists)
+std::vector<char> PositionManager::closeDateOrder(const std::string& inst_id, Offset offset) const {
+    auto it = instruments_.find(inst_id);
+    bool by_date = it != instruments_.end()
+                && (it->second.isSHFE() || it->second.isINE() || it->second.distinguishesDate());
+    if (by_date) {
+        if (offset == Offset::CloseToday) return {'1'};
+        if (offset == Offset::CloseYesterday) return {'2'};
+        return {'2', '1'};
+    }
+    return {'2', '1'};
+}
+
 // ============================================================
 // Order Lifecycle: Freeze
 // ============================================================
 
-bool PositionManager::onOrderRequest(const OrderRequest& req) {
+bool PositionManager::onOrderRequest(const std::string& order_key, const OrderRequest& req) {
     std::lock_guard lock(mtx_);
 
-    int vol = req.volume;
+    // A reused key would leak the previous reservation
+    if (auto old = order_freezes_.find(order_key); old != order_freezes_.end()) {
+        releaseLocked(old->second, old->second.volume);
+        order_freezes_.erase(old);
+    }
 
-    // Lookup instrument info
+    int vol = req.volume;
+    if (vol <= 0) return false;
+
     auto inst_it = instruments_.find(req.instrument);
     if (inst_it == instruments_.end()) {
         // No instrument info yet — skip freeze, margin will be verified by broker
@@ -183,177 +245,156 @@ bool PositionManager::onOrderRequest(const OrderRequest& req) {
     }
     const auto& inst = inst_it->second;
 
-    // Determine margin price for freeze
-    bool isYesterday = (req.offset == Offset::CloseYesterday || req.offset == Offset::Close);
-    double margin_price;
-    if (broker_margin_price_type_ == '4') {
-        margin_price = req.price;  // 开仓价: use order's limit price
-    } else {
-        margin_price = getMarginPrice(inst, req.instrument, isYesterday);
-        if (margin_price <= 0) margin_price = req.price;
-    }
-
     bool isOpen = (req.offset == Offset::Open);
     bool isCloseToday = (inst.distinguishesDate() && req.offset == Offset::CloseToday);
 
-    // Calculate margin to freeze
+    // Market orders freeze at the limit price on the order's side when known
+    double order_px = req.price;
+    if (req.type == OrderType::Market) {
+        const auto& limits = (req.direction == Direction::Buy) ? upper_limit_ : lower_limit_;
+        auto lit = limits.find(req.instrument);
+        if (lit != limits.end() && lit->second > 0) order_px = lit->second;
+    }
+
     double margin_freeze = 0.0;
     if (isOpen) {
-        margin_freeze = calcMargin(req.instrument, margin_price, vol,
-                                    (req.direction == Direction::Buy) ? '2' : '3', false);
-        // For market orders, use limit price for freeze calculation
-        if (req.type == OrderType::Market) {
-            // 市价单冻结用涨跌停价计算
-            // Simplified: use order price (limit) × factor
-            margin_freeze = calcMargin(req.instrument, margin_price, vol,
-                                        (req.direction == Direction::Buy) ? '2' : '3', false);
+        // calcMarginLocked applies MarginPriceType ('1'/'2' override order_px; '4' keeps it)
+        margin_freeze = calcMarginLocked(req.instrument, order_px, vol,
+                                         (req.direction == Direction::Buy) ? '2' : '3', false);
+    }
+    double comm_freeze = calcCommissionLocked(req.instrument, order_px, vol, isOpen, isCloseToday);
+
+    // account_.available already excludes existing reservations
+    double total_needed = margin_freeze + comm_freeze;
+    if (account_loaded_ && total_needed > 0 && account_.available < total_needed) {
+        return false;
+    }
+
+    OrderFreeze fr;
+    fr.instrument = req.instrument;
+    fr.direction = req.direction;
+    fr.offset = req.offset;
+    fr.volume = vol;
+    fr.margin = margin_freeze;
+    fr.commission = comm_freeze;
+
+    if (isOpen) {
+        fr.pos_dir = (req.direction == Direction::Buy) ? '2' : '3';
+        fr.buckets.emplace_back('1', vol);
+        auto& pos = positions_[posKey(req.instrument, fr.pos_dir, '1')];
+        pos.instrument = req.instrument;
+        pos.posi_direction = fr.pos_dir;
+        pos.position_date = '1';
+    } else {
+        // Closing freezes the opposite-side position, split across date buckets
+        fr.pos_dir = (req.direction == Direction::Buy) ? '3' : '2';
+        int remaining = vol;
+        char first_existing = 0;
+        for (char d : closeDateOrder(req.instrument, req.offset)) {
+            auto it = positions_.find(posKey(req.instrument, fr.pos_dir, d));
+            if (it == positions_.end()) continue;
+            if (!first_existing) first_existing = d;
+            int take = std::min(remaining, std::max(0, it->second.availClose()));
+            if (take > 0) {
+                fr.buckets.emplace_back(d, take);
+                remaining -= take;
+            }
+            if (remaining == 0) break;
+        }
+        if (remaining > 0 && first_existing) {
+            // Over-close: CTP will reject it; keep the freeze consistent until then
+            auto b = std::find_if(fr.buckets.begin(), fr.buckets.end(),
+                                  [&](const auto& p) { return p.first == first_existing; });
+            if (b != fr.buckets.end()) b->second += remaining;
+            else fr.buckets.emplace_back(first_existing, remaining);
         }
     }
 
-    // Calculate commission to freeze
-    double comm_freeze = calcCommissionForOrder(req.instrument, req.price, vol, isOpen, isCloseToday);
-
-    // Check sufficient funds (开仓需要保证金, 平仓只需要手续费)
-    double available = account_.available;
-    double current_frozen_margin = account_.frozen_margin;
-    double current_frozen_comm = account_.frozen_commission;
-
-    double total_needed = margin_freeze + comm_freeze;
-    double already_reserved = current_frozen_margin + current_frozen_comm;
-    if (available - already_reserved < total_needed && available > 0) {
-        return false; // Insufficient funds
+    for (const auto& [date, bvol] : fr.buckets) {
+        auto it = positions_.find(posKey(req.instrument, fr.pos_dir, date));
+        if (it == positions_.end()) continue;
+        auto& pos = it->second;
+        if (req.direction == Direction::Buy) pos.long_frozen += bvol;
+        else pos.short_frozen += bvol;
+        double share = static_cast<double>(bvol) / vol;
+        pos.frozen_margin += margin_freeze * share;
+        pos.frozen_commission += comm_freeze * share;
     }
 
-    // Apply freeze
     account_.frozen_margin += margin_freeze;
     account_.frozen_commission += comm_freeze;
+    order_freezes_[order_key] = std::move(fr);
 
-    // Update position freeze record
-    if (isOpen) {
-        char date = '1';
-        char dir = (req.direction == Direction::Buy) ? '2' : '3';
-        auto key = posKey(req.instrument, dir, date);
-        auto& pos = positions_[key];
-        pos.instrument = req.instrument;
-        pos.posi_direction = dir;
-        pos.position_date = date;
-
-        if (req.direction == Direction::Buy) {
-            pos.long_frozen += vol;
-        } else {
-            pos.short_frozen += vol;
-        }
-        pos.frozen_margin += margin_freeze;
-        pos.frozen_commission += comm_freeze;
-    } else {
-        // Closing: freeze opposite side position
-        char opp_dir = (req.direction == Direction::Buy) ? '3' : '2';
-        // Try today first, then yesterday
-        for (char d : {'1', '2'}) {
-            auto key = posKey(req.instrument, opp_dir, d);
-            auto it = positions_.find(key);
-            if (it != positions_.end()) {
-                if (req.direction == Direction::Buy) {
-                    it->second.long_frozen += vol;
-                } else {
-                    it->second.short_frozen += vol;
-                }
-                it->second.frozen_commission += comm_freeze;
-            }
-        }
-        account_.frozen_commission += comm_freeze;
-        // subtract the duplicate add above
-        account_.frozen_commission -= comm_freeze;
-        account_.frozen_commission += comm_freeze; // keep it
-    }
-
-    account_.balance = account_.pre_balance + account_.deposit - account_.withdraw
-                     + account_.position_profit + account_.close_profit - account_.commission;
-    account_.available = account_.balance - account_.curr_margin - account_.frozen_margin
-                       - account_.frozen_commission - account_.frozen_cash
-                       - account_.delivery_margin - account_.reserve;
-
+    recalcAccount();
     return true;
 }
 
 // ============================================================
-// Order Lifecycle: Unfreeze (Reject / Cancel)
+// Order Lifecycle: Unfreeze
 // ============================================================
 
-void PositionManager::onOrderRejectOrCancel(const OrderRequest& req, int unfilledVolume) {
-    std::lock_guard lock(mtx_);
+void PositionManager::releaseLocked(OrderFreeze& fr, int vol) {
+    vol = std::min(vol, fr.volume);
+    if (vol <= 0) return;
 
-    int vol = unfilledVolume;
-    if (vol <= 0) vol = req.volume;
+    double dm = (vol == fr.volume) ? fr.margin : fr.margin * vol / fr.volume;
+    double dc = (vol == fr.volume) ? fr.commission : fr.commission * vol / fr.volume;
 
-    auto inst_it = instruments_.find(req.instrument);
-
-    bool isOpen = (req.offset == Offset::Open);
-    bool isCloseToday = (inst_it != instruments_.end() && inst_it->second.distinguishesDate()
-                         && req.offset == Offset::CloseToday);
-
-    // Calculate margin to release
-    double margin_price = req.price; // use order price as reference
-    if (inst_it != instruments_.end() && broker_margin_price_type_ != '4') {
-        margin_price = getMarginPrice(inst_it->second, req.instrument, false);
-        if (margin_price <= 0) margin_price = req.price;
-    }
-
-    double margin_release = 0.0;
-    if (isOpen) {
-        margin_release = calcMargin(req.instrument, margin_price, vol,
-                                     (req.direction == Direction::Buy) ? '2' : '3', false);
-    }
-
-    double comm_release = calcCommissionForOrder(req.instrument, req.price, vol, isOpen, isCloseToday);
-
-    // Release
-    account_.frozen_margin = std::max(0.0, account_.frozen_margin - margin_release);
-    account_.frozen_commission = std::max(0.0, account_.frozen_commission - comm_release);
-
-    // Update position freeze
-    if (isOpen) {
-        char dir = (req.direction == Direction::Buy) ? '2' : '3';
-        auto key = posKey(req.instrument, dir, '1');
-        auto it = positions_.find(key);
+    int left = vol;
+    for (auto& [date, bvol] : fr.buckets) {
+        if (left == 0) break;
+        int take = std::min(left, bvol);
+        if (take == 0) continue;
+        auto it = positions_.find(posKey(fr.instrument, fr.pos_dir, date));
         if (it != positions_.end()) {
-            if (req.direction == Direction::Buy) {
-                it->second.long_frozen = std::max(0, it->second.long_frozen - vol);
-            } else {
-                it->second.short_frozen = std::max(0, it->second.short_frozen - vol);
-            }
-            it->second.frozen_margin = std::max(0.0, it->second.frozen_margin - margin_release);
-            it->second.frozen_commission = std::max(0.0, it->second.frozen_commission - comm_release);
+            auto& pos = it->second;
+            if (fr.direction == Direction::Buy) pos.long_frozen = std::max(0, pos.long_frozen - take);
+            else pos.short_frozen = std::max(0, pos.short_frozen - take);
+            double share = static_cast<double>(take) / vol;
+            pos.frozen_margin = std::max(0.0, pos.frozen_margin - dm * share);
+            pos.frozen_commission = std::max(0.0, pos.frozen_commission - dc * share);
         }
-    } else {
-        char opp_dir = (req.direction == Direction::Buy) ? '3' : '2';
-        for (char d : {'1', '2'}) {
-            auto key = posKey(req.instrument, opp_dir, d);
-            auto it = positions_.find(key);
-            if (it != positions_.end()) {
-                if (req.direction == Direction::Buy) {
-                    it->second.long_frozen = std::max(0, it->second.long_frozen - vol);
-                } else {
-                    it->second.short_frozen = std::max(0, it->second.short_frozen - vol);
-                }
-                it->second.frozen_commission = std::max(0.0, it->second.frozen_commission - comm_release);
-            }
-        }
+        bvol -= take;
+        left -= take;
     }
 
-    account_.balance = account_.pre_balance + account_.deposit - account_.withdraw
-                     + account_.position_profit + account_.close_profit - account_.commission;
-    account_.available = account_.balance - account_.curr_margin - account_.frozen_margin
-                       - account_.frozen_commission - account_.frozen_cash
-                       - account_.delivery_margin - account_.reserve;
+    account_.frozen_margin = std::max(0.0, account_.frozen_margin - dm);
+    account_.frozen_commission = std::max(0.0, account_.frozen_commission - dc);
+    fr.volume -= vol;
+    fr.margin -= dm;
+    fr.commission -= dc;
+}
+
+void PositionManager::releaseOrder(const std::string& order_key, int volume) {
+    std::lock_guard lock(mtx_);
+    auto it = order_freezes_.find(order_key);
+    if (it == order_freezes_.end()) return;
+    releaseLocked(it->second, volume);
+    if (it->second.volume <= 0) order_freezes_.erase(it);
+    recalcAccount();
+}
+
+std::optional<OrderFreeze> PositionManager::getOrderFreeze(const std::string& order_key) const {
+    std::lock_guard lock(mtx_);
+    auto it = order_freezes_.find(order_key);
+    if (it == order_freezes_.end()) return std::nullopt;
+    return it->second;
 }
 
 // ============================================================
 // Trade Fill
 // ============================================================
 
-void PositionManager::onTradeFill(const TradeRecord& trade) {
+void PositionManager::onTradeFill(const TradeRecord& trade, const std::string& order_key) {
     std::lock_guard lock(mtx_);
+
+    if (!order_key.empty()) {
+        auto fit = order_freezes_.find(order_key);
+        if (fit != order_freezes_.end()) {
+            releaseLocked(fit->second, trade.volume);
+            if (fit->second.volume <= 0) order_freezes_.erase(fit);
+        }
+    }
 
     auto inst_it = instruments_.find(trade.instrument);
     double mult = (inst_it != instruments_.end()) ? inst_it->second.volume_multiple : 1.0;
@@ -364,51 +405,27 @@ void PositionManager::onTradeFill(const TradeRecord& trade) {
     if (trade.offset == Offset::Open) {
         // ---- OPENING TRADE ----
         char dir = (trade.direction == Direction::Buy) ? '2' : '3';
-        auto key = posKey(trade.instrument, dir, '1');
-        auto& pos = positions_[key];
+        auto& pos = positions_[posKey(trade.instrument, dir, '1')];
         pos.instrument = trade.instrument;
         pos.posi_direction = dir;
         pos.position_date = '1';
 
-        // Unfreeze
-        if (trade.direction == Direction::Buy) {
-            pos.long_frozen = std::max(0, pos.long_frozen - vol);
-        } else {
-            pos.short_frozen = std::max(0, pos.short_frozen - vol);
-        }
-
-        double margin_to_release = calcMargin(trade.instrument, trade.price, vol, dir, false);
-        pos.frozen_margin = std::max(0.0, pos.frozen_margin - margin_to_release);
-        // Clean up any residual: freeze used order price (MarginPriceType='4'),
-        //   release uses trade price. The difference should be treated as released.
-        double fmg_cleanup = pos.frozen_margin;
-        pos.frozen_margin = 0;
-        account_.frozen_margin = std::max(0.0, account_.frozen_margin - margin_to_release - fmg_cleanup);
-
-        // Commission
-        double comm = calcCommissionForOrder(trade.instrument, trade.price, vol, true, false);
+        double comm = calcCommissionLocked(trade.instrument, trade.price, vol, true, false);
         pos.commission += comm;
         account_.commission += comm;
-        // Release frozen commission for this fill + cleanup residual
-        double comm_cleanup = pos.frozen_commission;
-        pos.frozen_commission = 0;
-        account_.frozen_commission = std::max(0.0, account_.frozen_commission - comm - comm_cleanup);
 
-        // Update actual position
         pos.position += vol;
         pos.today_position += vol;
         pos.open_cost += trade.price * vol * mult;
         pos.position_cost += trade.price * vol * mult;
 
-        // calcMargin resolves effective price via MarginPriceType:
+        // calcMarginLocked resolves effective price via MarginPriceType:
         //   type='4' → trade.price (开仓价)
         //   type='1' → PreSettlementPrice (昨结算价)
         //   type='2' → LastPrice (最新价)
-        double used_margin = calcMargin(trade.instrument, trade.price, vol, dir, false);
+        double used_margin = calcMarginLocked(trade.instrument, trade.price, vol, dir, false);
         pos.margin += used_margin;
         account_.curr_margin += used_margin;
-
-
     } else {
         // ---- CLOSING TRADE ----
         char opp_dir = (trade.direction == Direction::Buy) ? '3' : '2';
@@ -422,21 +439,7 @@ void PositionManager::onTradeFill(const TradeRecord& trade) {
                         (inst_it->second.isSHFE() || inst_it->second.isINE()));
         bool is_cffex = (inst_it != instruments_.end() && inst_it->second.isCFFEX());
 
-        // Determine close order
-        std::vector<char> date_order;
-        if (is_shfe) {
-            // SHFE/INE: user explicitly specifies which date to close
-            if (trade.offset == Offset::CloseToday) {
-                date_order = {'1'};
-            } else if (trade.offset == Offset::CloseYesterday) {
-                date_order = {'2'};
-            } else {
-                date_order = {'1', '2'}; // fallback: today first
-            }
-        } else {
-            // DCE/CZCE/CFFEX: 优先平昨 (FIFO, but yesterday first)
-            date_order = {'2', '1'};
-        }
+        std::vector<char> date_order = closeDateOrder(trade.instrument, trade.offset);
 
         // CFFEX commission trap tracking: fees calculated as if "today-first"
         int cffex_today_fee_remaining = 0;
@@ -456,13 +459,6 @@ void PositionManager::onTradeFill(const TradeRecord& trade) {
             if (it == positions_.end()) continue;
             auto& pos = it->second;
 
-            // Unfreeze
-            if (trade.direction == Direction::Buy) {
-                pos.long_frozen = std::max(0, pos.long_frozen - remaining);
-            } else {
-                pos.short_frozen = std::max(0, pos.short_frozen - remaining);
-            }
-
             int close_vol = std::min(remaining, pos.position);
             remaining -= close_vol;
 
@@ -476,14 +472,14 @@ void PositionManager::onTradeFill(const TradeRecord& trade) {
                     int fee_as_today = std::min(close_vol, cffex_today_fee_remaining);
                     cffex_today_fee_remaining -= fee_as_today;
                     double comm_today = fee_as_today > 0
-                        ? calcCommissionForOrder(trade.instrument, trade.price, fee_as_today, false, true) : 0.0;
+                        ? calcCommissionLocked(trade.instrument, trade.price, fee_as_today, false, true) : 0.0;
                     double comm_yesterday = (close_vol - fee_as_today) > 0
-                        ? calcCommissionForOrder(trade.instrument, trade.price, close_vol - fee_as_today, false, false) : 0.0;
+                        ? calcCommissionLocked(trade.instrument, trade.price, close_vol - fee_as_today, false, false) : 0.0;
                     comm = comm_today + comm_yesterday;
                 } else if (is_shfe || pos_date_type == '2') {
                     // SHFE/INE: date slot determines fee type
                     bool isCT = (d == '1');
-                    comm = calcCommissionForOrder(trade.instrument, trade.price, close_vol, false, isCT);
+                    comm = calcCommissionLocked(trade.instrument, trade.price, close_vol, false, isCT);
                 } else {
                     // DCE/CZCE/GFEX: single slot contains both today+yesterday positions
                     // Close order: yesterday first (date_order = {'2','1'}, but only d='1' exists)
@@ -491,15 +487,13 @@ void PositionManager::onTradeFill(const TradeRecord& trade) {
                     int yesterday_vol = std::min(close_vol, yd_pos);
                     int today_vol = close_vol - yesterday_vol;
                     double comm_yd = yesterday_vol > 0
-                        ? calcCommissionForOrder(trade.instrument, trade.price, yesterday_vol, false, false) : 0.0;
+                        ? calcCommissionLocked(trade.instrument, trade.price, yesterday_vol, false, false) : 0.0;
                     double comm_td = today_vol > 0
-                        ? calcCommissionForOrder(trade.instrument, trade.price, today_vol, false, true) : 0.0;
+                        ? calcCommissionLocked(trade.instrument, trade.price, today_vol, false, true) : 0.0;
                     comm = comm_yd + comm_td;
                 }
                 pos.commission += comm;
                 account_.commission += comm;
-                pos.frozen_commission = std::max(0.0, pos.frozen_commission - comm);
-                account_.frozen_commission = std::max(0.0, account_.frozen_commission - comm);
             }
 
             // Close profit (mark-to-market)
@@ -570,20 +564,13 @@ void PositionManager::onTradeFill(const TradeRecord& trade) {
             if (pos.position <= 0) {
                 pos.position_profit = 0;
             } else {
-                // Keep existing position_profit (set by onTick, or 0 for new opens)
-                // For newly opened positions, position_profit=0 until next tick
                 total_pos_profit += pos.position_profit;
             }
         }
         account_.position_profit = total_pos_profit;
     }
 
-    // Derive Balance from static baseline + dynamic P&L
-    account_.balance = account_.pre_balance + account_.deposit - account_.withdraw
-                     + account_.position_profit + account_.close_profit - account_.commission;
-    account_.available = account_.balance - account_.curr_margin - account_.frozen_margin
-                       - account_.frozen_commission - account_.frozen_cash
-                       - account_.delivery_margin - account_.reserve;
+    recalcAccount();
 }
 
 // ============================================================
@@ -603,6 +590,8 @@ void PositionManager::onTick(const TickData& tick) {
     if (tick.pre_settlement > 0 && tick.pre_settlement < kCtpInvalid) {
         pre_settlement_[tick.instrument] = tick.pre_settlement;
     }
+    if (tick.upper_limit > 0 && tick.upper_limit < kCtpInvalid) upper_limit_[tick.instrument] = tick.upper_limit;
+    if (tick.lower_limit > 0 && tick.lower_limit < kCtpInvalid) lower_limit_[tick.instrument] = tick.lower_limit;
 
     // Note on AveragePrice/Turnover exchange differences (for K-line synthesis):
     //   郑商所(CZCE): AveragePrice from exchange, can use directly.
@@ -617,6 +606,7 @@ void PositionManager::onTick(const TickData& tick) {
 
     if (is_option) {
         // Options have NO PositionProfit — PnL reflected in权利金收支 (CashIn)
+        recalcAccount();
         return;
     }
 
@@ -659,7 +649,7 @@ void PositionManager::onTick(const TickData& tick) {
                 if (pit == positions_.end() || pit->second.position <= 0) continue;
                 auto& pos = pit->second;
                 bool isYesterday = (date == '2');
-                double new_margin = calcMargin(tick.instrument, tick.last_price,
+                double new_margin = calcMarginLocked(tick.instrument, tick.last_price,
                                                pos.position, dir, isYesterday);
                 margin_delta += new_margin - pos.margin;
                 pos.margin = new_margin;
@@ -667,38 +657,39 @@ void PositionManager::onTick(const TickData& tick) {
         }
         account_.curr_margin += margin_delta;
     }
-    // Derive Balance from baseline formula (not delta-accumulated)
-    account_.balance = account_.pre_balance + account_.deposit - account_.withdraw
-                     + account_.position_profit + account_.close_profit - account_.commission;
-    account_.available = account_.balance - account_.curr_margin - account_.frozen_margin
-                       - account_.frozen_commission - account_.frozen_cash
-                       - account_.delivery_margin - account_.reserve;
+    recalcAccount();
 }
 
 // ============================================================
 // Bulk Query
 // ============================================================
 
+void PositionManager::clearPositions() {
+    std::lock_guard lock(mtx_);
+    positions_.clear();
+}
+
 void PositionManager::onQueryPosition(const PositionRecord& pos) {
     std::lock_guard lock(mtx_);
-    auto key = posKey(pos.instrument, pos.posi_direction, pos.position_date);
-    positions_[key] = pos;
+    positions_[posKey(pos.instrument, pos.posi_direction, pos.position_date)] = pos;
 }
 
 void PositionManager::onQueryAccount(const AccountRecord& acc) {
     std::lock_guard lock(mtx_);
     account_ = acc;
+    account_loaded_ = true;
 }
 
 // ============================================================
 // Query
 // ============================================================
 
-PositionRecord* PositionManager::getPosition(const std::string& inst, char dir, char date) {
+std::optional<PositionRecord> PositionManager::getPosition(const std::string& inst, char dir,
+                                                           char date) const {
     std::lock_guard lock(mtx_);
-    auto key = posKey(inst, dir, date);
-    auto it = positions_.find(key);
-    return it != positions_.end() ? &it->second : nullptr;
+    auto it = positions_.find(posKey(inst, dir, date));
+    if (it == positions_.end()) return std::nullopt;
+    return it->second;
 }
 
 AccountRecord PositionManager::getAccount() const {
@@ -711,6 +702,11 @@ double PositionManager::getAvailable() const {
     return account_.available;
 }
 
+bool PositionManager::isAccountLoaded() const {
+    std::lock_guard lock(mtx_);
+    return account_loaded_;
+}
+
 void PositionManager::getAllPositions(std::vector<PositionRecord>& out) const {
     std::lock_guard lock(mtx_);
     for (const auto& [k, v] : positions_) {
@@ -721,7 +717,9 @@ void PositionManager::getAllPositions(std::vector<PositionRecord>& out) const {
 void PositionManager::reset() {
     std::lock_guard lock(mtx_);
     positions_.clear();
+    order_freezes_.clear();
     account_ = AccountRecord{};
+    account_loaded_ = false;
 }
 
 } // namespace falcon

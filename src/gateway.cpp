@@ -1,9 +1,9 @@
 #include "gateway.h"
 #include "logger.h"
-#include <cstring>
 #include <chrono>
-#include <thread>
 #include <filesystem>
+#include <future>
+#include <thread>
 
 namespace falcon {
 
@@ -14,18 +14,44 @@ FalconGateway::FalconGateway(const GatewayConfig& cfg) : config_(cfg) {
 }
 
 FalconGateway::~FalconGateway() {
-    LOG_INFO("[Gateway] Destroying...");
     stop();
 }
 
 // ============================================================
 // Lifecycle
 // ============================================================
+bool FalconGateway::validateConfig() const {
+    // Every field must fit the CTP char[] it is copied into
+    CThostFtdcReqUserLoginField l{};
+    CThostFtdcReqAuthenticateField a{};
+    struct Check { const char* name; bool ok; };
+    const Check checks[] = {
+        {"broker_id", copyField(l.BrokerID, config_.broker_id)},
+        {"user_id",   copyField(l.UserID, config_.user_id)},
+        {"password",  copyField(l.Password, config_.password)},
+        {"app_id",    copyField(a.AppID, config_.app_id)},
+        {"auth_code", copyField(a.AuthCode, config_.auth_code)},
+    };
+    bool ok = true;
+    for (const auto& c : checks) {
+        if (!c.ok) {
+            LOG_ERROR("[Gateway] Config field {} is too long for CTP", c.name);
+            ok = false;
+        }
+    }
+    if (config_.trade_front.empty() || config_.market_front.empty()) {
+        LOG_ERROR("[Gateway] trade_front and market_front are required");
+        ok = false;
+    }
+    return ok;
+}
+
 bool FalconGateway::start() {
     if (running_) {
         LOG_WARN("[Gateway] Already running");
         return true;
     }
+    if (!validateConfig()) return false;
 
     LOG_INFO("[Gateway] Starting. flow_trade={} flow_market={}",
              config_.flow_path_trade, config_.flow_path_market);
@@ -42,8 +68,42 @@ bool FalconGateway::start() {
         }
     }
 
+    trader_handler_->resetState();
+    md_handler_->resetState();
+    ready_ = false;
+    startup_done_ = false;
+    login_fail_reported_ = false;
+
+    // Wire callbacks before Init(): SPI callbacks may fire immediately
+    trader_handler_->flow_ctrl = &flow_ctrl_;
+    trader_handler_->on_error = [this](int e, const std::string& m) {
+        if (error_cb_) error_cb_(e, m);
+    };
+    trader_handler_->on_instrument = [this](const InstrumentInfo* info, bool last) {
+        onInstrumentResponse(info, last);
+    };
+    trader_handler_->on_commission_rate = [this](const std::string& id, const CommissionInfo& comm) {
+        position_mgr_.setCommission(id, comm);
+    };
+    trader_handler_->on_broker_params = [this](char mpt) {
+        position_mgr_.setBrokerMarginPriceType(mpt);
+        LOG_INFO("[Gateway] Broker MarginPriceType={}", mpt);
+    };
+    {
+        std::lock_guard lk(sub_mtx_);
+        subscribed_.insert(config_.subscribe_list.begin(), config_.subscribe_list.end());
+    }
+
+    flow_ctrl_.start();
+
     trade_api_ = CThostFtdcTraderApi::CreateFtdcTraderApi(config_.flow_path_trade.c_str());
-    LOG_INFO("[Gateway] TraderApi created. version={}", trade_api_->GetApiVersion());
+    md_api_ = CThostFtdcMdApi::CreateFtdcMdApi(config_.flow_path_market.c_str());
+    LOG_INFO("[Gateway] TraderApi version={} MdApi version={}",
+             CThostFtdcTraderApi::GetApiVersion(), CThostFtdcMdApi::GetApiVersion());
+
+    running_ = true;
+    trade_worker_ = std::thread(&FalconGateway::tradeWorkerLoop, this);
+    md_worker_ = std::thread(&FalconGateway::mdWorkerLoop, this);
 
     trade_api_->RegisterSpi(trader_handler_.get());
     trade_api_->SubscribePrivateTopic(THOST_TERT_RESTART);
@@ -51,65 +111,30 @@ bool FalconGateway::start() {
     trade_api_->RegisterFront(const_cast<char*>(config_.trade_front.c_str()));
     trade_api_->Init();
 
-    md_api_ = CThostFtdcMdApi::CreateFtdcMdApi(config_.flow_path_market.c_str());
-    LOG_INFO("[Gateway] MdApi created. version={}", md_api_->GetApiVersion());
-
     md_api_->RegisterSpi(md_handler_.get());
     md_api_->RegisterFront(const_cast<char*>(config_.market_front.c_str()));
     md_api_->Init();
-
-    trader_handler_->order_mgr = &order_mgr_;
-    trader_handler_->position_mgr = &position_mgr_;
-    trader_handler_->flow_ctrl = &flow_ctrl_;
-    trader_handler_->on_error = [this](int e, const std::string& m) {
-        LOG_ERROR("[TraderSPI] err={} msg={}", e, m);
-        if (error_cb_) error_cb_(e, m);
-    };
-    trader_handler_->on_instrument = [this](CThostFtdcInstrumentField* inst, bool last) {
-        onInstrumentResponse(inst, last);
-    };
-    trader_handler_->on_commission_rate = [this](const std::string& id,
-        double om, double ov, double cm, double cv, double ctm, double ctv) {
-        CommissionInfo comm;
-        comm.open_ratio_by_money = om;
-        comm.open_ratio_by_volume = ov;
-        comm.close_ratio_by_money = cm;
-        comm.close_ratio_by_volume = cv;
-        comm.close_today_ratio_by_money = ctm;
-        comm.close_today_ratio_by_volume = ctv;
-        position_mgr_.setCommission(id, comm);
-    };
-    trader_handler_->on_broker_params = [this](char mpt) {
-        position_mgr_.setBrokerMarginPriceType(mpt);
-        LOG_INFO("[Gateway] Broker MarginPriceType={}", mpt);
-    };
-
-    running_ = true;
-    trade_worker_ = std::make_unique<std::thread>(&FalconGateway::tradeWorkerLoop, this);
-    md_worker_ = std::make_unique<std::thread>(&FalconGateway::mdWorkerLoop, this);
 
     LOG_INFO("[Gateway] Started. Waiting for connection...");
     return true;
 }
 
 void FalconGateway::stop() {
-    if (!running_) return;
+    if (!running_.exchange(false)) return;
 
     LOG_INFO("[Gateway] Stopping...");
+    ready_ = false;
 
-    running_ = false;
+    // Workers and the flow thread call into the APIs; stop them first
+    trader_handler_->stopping = true;
+    if (trade_worker_.joinable()) trade_worker_.join();
+    if (md_worker_.joinable()) md_worker_.join();
+    flow_ctrl_.stop();
 
-    int active = 0;
-    order_mgr_.forEachActive([&](const OrderRecord& ord) {
-        active++;
-        if (ord.order_sys_id[0] != '\0') {
-            cancelOrderBySysID(std::string(ord.order_sys_id.data()),
-                               ord.request.exchange, ord.request.instrument);
-        }
-    });
-
-    if (active > 0) {
-        LOG_INFO("[Gateway] Cancelling {} active orders...", active);
+    auto active = order_mgr_.activeOrders();
+    if (!active.empty() && trade_api_) {
+        LOG_INFO("[Gateway] Cancelling {} active orders...", active.size());
+        for (const auto& ord : active) cancelOrderRecord(ord);
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
@@ -124,10 +149,7 @@ void FalconGateway::stop() {
         md_api_ = nullptr;
     }
 
-    if (trade_worker_ && trade_worker_->joinable()) trade_worker_->join();
-    if (md_worker_ && md_worker_->joinable()) md_worker_->join();
-
-    ready_ = false;
+    startup_done_ = false;
     LOG_INFO("[Gateway] Stopped");
 }
 
@@ -136,31 +158,22 @@ void FalconGateway::stop() {
 // ============================================================
 
 int FalconGateway::sendOrder(const OrderRequest& req) {
-    if (!trade_api_) {
-        LOG_ERROR("[Gateway] sendOrder failed: API not initialized");
-        return -1;
-    }
-    if (!ready_) {
+    if (!trade_api_ || !ready_) {
         LOG_ERROR("[Gateway] sendOrder failed: not ready");
         return -1;
     }
 
-    // ---- Pre-trade risk check via PositionManager ----
-    bool ok = position_mgr_.onOrderRequest(req);
-    if (!ok) {
-        LOG_WARN("[Gateway] sendOrder REJECTED: insufficient margin. inst={} dir={} offset={} px={} vol={}",
-                 req.instrument, static_cast<char>(req.direction),
-                 static_cast<char>(req.offset), req.price, req.volume);
-        if (error_cb_) error_cb_(-100, "Insufficient margin for " + req.instrument);
-        return -2;
-    }
-
     CThostFtdcInputOrderField field{};
-    strcpy(field.BrokerID, config_.broker_id.c_str());
-    strcpy(field.UserID, config_.user_id.c_str());
-    strcpy(field.InvestorID, config_.user_id.c_str());
-    strcpy(field.InstrumentID, req.instrument.c_str());
-    strcpy(field.ExchangeID, req.exchange.c_str());
+    if (req.volume <= 0
+        || !copyField(field.InstrumentID, req.instrument) || req.instrument.empty()
+        || !copyField(field.ExchangeID, req.exchange)) {
+        LOG_ERROR("[Gateway] sendOrder rejected: invalid request inst='{}' exch='{}' vol={}",
+                  req.instrument, req.exchange, req.volume);
+        return -3;
+    }
+    (void)copyField(field.BrokerID, config_.broker_id);   // validated in start()
+    (void)copyField(field.UserID, config_.user_id);
+    (void)copyField(field.InvestorID, config_.user_id);
     field.Direction = static_cast<char>(req.direction);
     field.CombOffsetFlag[0] = static_cast<char>(req.offset);
     field.CombHedgeFlag[0] = req.hedge_flag;
@@ -186,207 +199,262 @@ int FalconGateway::sendOrder(const OrderRequest& req) {
     field.UserForceClose = 0;
     field.MinVolume = 1;
 
+    // Register the order before sending: OnRtnOrder/OnRtnTrade may arrive on
+    // the SPI thread before ReqOrderInsert returns.
+    std::lock_guard send_lock(send_mtx_);
+    int front = trader_handler_->front_id;
+    int session = trader_handler_->session_id;
     std::string order_ref = std::to_string(++trader_handler_->max_order_ref);
-    strcpy(field.OrderRef, order_ref.c_str());
+    if (!copyField(field.OrderRef, order_ref)) return -3;
+    auto key = OrderManager::makeKey(front, session, order_ref);
+
+    if (!position_mgr_.onOrderRequest(key, req)) {
+        LOG_WARN("[Gateway] sendOrder REJECTED: insufficient funds. inst={} dir={} offset={} px={} vol={}",
+                 req.instrument, static_cast<char>(req.direction),
+                 static_cast<char>(req.offset), req.price, req.volume);
+        if (error_cb_) error_cb_(-100, "Insufficient funds for " + req.instrument);
+        return -2;
+    }
+    if (!order_mgr_.create(req, front, session, order_ref)) {
+        LOG_ERROR("[Gateway] Duplicate OrderRef {}", key);
+        position_mgr_.releaseOrder(key, req.volume);
+        return -4;
+    }
 
     int ret = trade_api_->ReqOrderInsert(&field, req.request_id);
     if (ret != 0) {
         LOG_ERROR("[Gateway] ReqOrderInsert API rejected. inst={} ret={}", req.instrument, ret);
-        position_mgr_.onOrderRejectOrCancel(req, req.volume);
+        order_mgr_.remove(key);
+        position_mgr_.releaseOrder(key, req.volume);
         return ret;
     }
 
-    order_mgr_.create(req, trader_handler_->front_id, trader_handler_->session_id, order_ref);
     LOG_INFO("[Gateway] Order sent. inst={} dir={} offset={} px={:.2f} vol={} ref={}",
              req.instrument, static_cast<char>(req.direction),
              static_cast<char>(req.offset), req.price, req.volume, order_ref);
+    return 0;
+}
+
+int FalconGateway::cancelOrderRecord(const OrderRecord& ord) {
+    if (!trade_api_) return -1;
+    CThostFtdcInputOrderActionField field{};
+    (void)copyField(field.BrokerID, config_.broker_id);
+    (void)copyField(field.UserID, config_.user_id);
+    (void)copyField(field.InvestorID, config_.user_id);
+    if (!copyField(field.ExchangeID, ord.request.exchange)
+        || !copyField(field.InstrumentID, ord.request.instrument)) {
+        return -3;
+    }
+    if (ord.order_sys_id[0] != '\0') {
+        (void)copyField(field.OrderSysID, ord.order_sys_id.data());
+    } else {
+        // Not yet accepted by the exchange: cancel by FrontID + SessionID + OrderRef
+        field.FrontID = ord.front_id;
+        field.SessionID = ord.session_id;
+        (void)copyField(field.OrderRef, ord.order_ref.data());
+    }
+    field.ActionFlag = THOST_FTDC_AF_Delete;
+
+    int ret = trade_api_->ReqOrderAction(&field, 0);
+    if (ret != 0) {
+        LOG_ERROR("[Gateway] ReqOrderAction failed. ref={} sys_id={} ret={}",
+                  ord.order_ref.data(), ord.order_sys_id.data(), ret);
+    }
     return ret;
 }
 
 int FalconGateway::cancelOrder(const std::string& order_ref) {
-    auto key = std::to_string(trader_handler_->front_id) + "_"
-             + std::to_string(trader_handler_->session_id) + "_" + order_ref;
-    auto* ord = order_mgr_.findByOrderRef(key);
+    auto key = OrderManager::makeKey(trader_handler_->front_id, trader_handler_->session_id, order_ref);
+    auto ord = order_mgr_.findByKey(key);
     if (!ord) {
         LOG_WARN("[Gateway] cancelOrder: order not found. ref={}", order_ref);
         return -1;
     }
     LOG_INFO("[Gateway] Cancel order. ref={} sys_id={}", order_ref, ord->order_sys_id.data());
-    return cancelOrderBySysID(std::string(ord->order_sys_id.data()),
-                              ord->request.exchange, ord->request.instrument);
+    return cancelOrderRecord(*ord);
 }
 
 int FalconGateway::cancelOrderBySysID(const std::string& sys_id, const std::string& ex,
                                        const std::string& inst) {
-    if (!trade_api_) {
-        LOG_ERROR("[Gateway] cancelOrderBySysID: API not initialized");
-        return -1;
-    }
-    CThostFtdcInputOrderActionField field{};
-    strcpy(field.BrokerID, config_.broker_id.c_str());
-    strcpy(field.UserID, config_.user_id.c_str());
-    strcpy(field.InvestorID, config_.user_id.c_str());
-    strcpy(field.OrderSysID, sys_id.c_str());
-    strcpy(field.ExchangeID, ex.c_str());
-    strcpy(field.InstrumentID, inst.c_str());
-    field.ActionFlag = THOST_FTDC_AF_Delete;
+    OrderRecord ord;
+    ord.request.exchange = ex;
+    ord.request.instrument = inst;
+    if (sys_id.empty() || sys_id.size() >= ord.order_sys_id.size()) return -3;
+    std::copy(sys_id.begin(), sys_id.end(), ord.order_sys_id.begin());
+    return cancelOrderRecord(ord);
+}
 
-    int ret = trade_api_->ReqOrderAction(&field, 0);
-    if (ret != 0) {
-        LOG_ERROR("[Gateway] ReqOrderAction failed. sys_id={} ret={}", sys_id, ret);
+int FalconGateway::cancelAllActive() {
+    auto active = order_mgr_.activeOrders();
+    int count = 0;
+    for (const auto& ord : active) {
+        if (cancelOrderRecord(ord) == 0) count++;
     }
-    return ret;
+    LOG_INFO("[Gateway] CancelAllActive: {}/{} cancel requests sent", count, active.size());
+    return count;
 }
 
 // ============================================================
 // Market Data
 // ============================================================
 void FalconGateway::subscribe(const std::vector<std::string>& instruments) {
-    if (!md_api_ || instruments.empty()) return;
+    if (instruments.empty()) return;
+    {
+        std::lock_guard lk(sub_mtx_);
+        subscribed_.insert(instruments.begin(), instruments.end());
+    }
+    if (!md_api_) return;
 
     std::vector<char*> ptrs;
     for (const auto& s : instruments) ptrs.push_back(const_cast<char*>(s.c_str()));
-
-    int count = static_cast<int>(ptrs.size());
-    md_api_->SubscribeMarketData(ptrs.data(), count);
-    LOG_INFO("[Gateway] Subscribed to {} instruments", count);
+    md_api_->SubscribeMarketData(ptrs.data(), static_cast<int>(ptrs.size()));
+    LOG_INFO("[Gateway] Subscribed to {} instruments", ptrs.size());
 }
 
 void FalconGateway::unsubscribe(const std::vector<std::string>& instruments) {
-    if (!md_api_ || instruments.empty()) return;
+    if (instruments.empty()) return;
+    {
+        std::lock_guard lk(sub_mtx_);
+        for (const auto& s : instruments) subscribed_.erase(s);
+    }
+    if (!md_api_) return;
 
     std::vector<char*> ptrs;
     for (const auto& s : instruments) ptrs.push_back(const_cast<char*>(s.c_str()));
-
-    int count = static_cast<int>(ptrs.size());
-    md_api_->UnSubscribeMarketData(ptrs.data(), count);
-    LOG_INFO("[Gateway] Unsubscribed from {} instruments", count);
+    md_api_->UnSubscribeMarketData(ptrs.data(), static_cast<int>(ptrs.size()));
+    LOG_INFO("[Gateway] Unsubscribed from {} instruments", ptrs.size());
 }
 
 // ============================================================
 // Query
 // ============================================================
-void FalconGateway::queryPosition() {
-    flow_ctrl_.submit([this]() {
+void FalconGateway::submitQuery(const char* name, std::function<int(int)> req, bool verify) {
+    flow_ctrl_.submit([this, name, verify, req = std::move(req)](int request_id) {
+        if (!trade_api_) return 0;
+        trader_handler_->verify_request_id = verify ? request_id : -1;
+        LOG_DEBUG("[Gateway] {} request_id={}{}", name, request_id, verify ? " (verify)" : "");
+        return req(request_id);
+    }, name);
+}
+
+void FalconGateway::submitPositionQuery(bool verify, bool replace_snapshot) {
+    submitQuery("ReqQryInvestorPosition", [this, replace_snapshot](int id) {
         CThostFtdcQryInvestorPositionField f{};
-        strcpy(f.BrokerID, config_.broker_id.c_str());
-        strcpy(f.InvestorID, config_.user_id.c_str());
-        LOG_DEBUG("[Gateway] ReqQryInvestorPosition");
-        trade_api_->ReqQryInvestorPosition(&f, 0);
-    });
+        (void)copyField(f.BrokerID, config_.broker_id);
+        (void)copyField(f.InvestorID, config_.user_id);
+        // Positions that no longer exist would otherwise survive the snapshot
+        if (replace_snapshot) position_mgr_.clearPositions();
+        return trade_api_->ReqQryInvestorPosition(&f, id);
+    }, verify);
 }
 
-void FalconGateway::queryAccount() {
-    flow_ctrl_.submit([this]() {
+void FalconGateway::submitAccountQuery(bool verify) {
+    submitQuery("ReqQryTradingAccount", [this](int id) {
         CThostFtdcQryTradingAccountField f{};
-        strcpy(f.BrokerID, config_.broker_id.c_str());
-        strcpy(f.InvestorID, config_.user_id.c_str());
-        LOG_DEBUG("[Gateway] ReqQryTradingAccount");
-        trade_api_->ReqQryTradingAccount(&f, 0);
-    });
+        (void)copyField(f.BrokerID, config_.broker_id);
+        (void)copyField(f.InvestorID, config_.user_id);
+        return trade_api_->ReqQryTradingAccount(&f, id);
+    }, verify);
 }
 
-void FalconGateway::queryOrder() {
-    flow_ctrl_.submit([this]() {
+void FalconGateway::submitOrderQuery(bool verify) {
+    submitQuery("ReqQryOrder", [this](int id) {
         CThostFtdcQryOrderField f{};
-        strcpy(f.BrokerID, config_.broker_id.c_str());
-        strcpy(f.InvestorID, config_.user_id.c_str());
-        LOG_DEBUG("[Gateway] ReqQryOrder");
-        trade_api_->ReqQryOrder(&f, 0);
-    });
+        (void)copyField(f.BrokerID, config_.broker_id);
+        (void)copyField(f.InvestorID, config_.user_id);
+        return trade_api_->ReqQryOrder(&f, id);
+    }, verify);
 }
 
-void FalconGateway::queryTrade() {
-    flow_ctrl_.submit([this]() {
+void FalconGateway::submitTradeQuery(bool verify) {
+    submitQuery("ReqQryTrade", [this](int id) {
         CThostFtdcQryTradeField f{};
-        strcpy(f.BrokerID, config_.broker_id.c_str());
-        strcpy(f.InvestorID, config_.user_id.c_str());
-        LOG_DEBUG("[Gateway] ReqQryTrade");
-        trade_api_->ReqQryTrade(&f, 0);
-    });
+        (void)copyField(f.BrokerID, config_.broker_id);
+        (void)copyField(f.InvestorID, config_.user_id);
+        return trade_api_->ReqQryTrade(&f, id);
+    }, verify);
 }
+
+void FalconGateway::queryPosition() { submitPositionQuery(false, false); }
+void FalconGateway::queryAccount()  { submitAccountQuery(false); }
+void FalconGateway::queryOrder()    { submitOrderQuery(false); }
+void FalconGateway::queryTrade()    { submitTradeQuery(false); }
 
 void FalconGateway::queryInstrument(const std::string& product_id) {
-    flow_ctrl_.submit([this, product_id]() {
+    submitQuery("ReqQryInstrument", [this, product_id](int id) {
         CThostFtdcQryInstrumentField f{};
-        if (!product_id.empty()) {
-            strcpy(f.ProductID, product_id.c_str());
-            LOG_DEBUG("[Gateway] ReqQryInstrument product={}", product_id);
-        } else {
-            LOG_DEBUG("[Gateway] ReqQryInstrument (all)");
+        if (!copyField(f.ProductID, product_id)) {
+            LOG_ERROR("[Gateway] product_filter '{}' too long", product_id);
+            return 0;
         }
-        trade_api_->ReqQryInstrument(&f, 0);
+        return trade_api_->ReqQryInstrument(&f, id);
     });
+}
+
+std::vector<TradeRecord> FalconGateway::tradeHistory() const {
+    std::lock_guard lk(history_mtx_);
+    return trade_history_;
 }
 
 // ============================================================
 // Init Sequence
 // ============================================================
 void FalconGateway::onLoginSuccess() {
-    confirmSettlement();
-}
-
-void FalconGateway::confirmSettlement() {
-    flow_ctrl_.submit([this]() {
-        CThostFtdcSettlementInfoConfirmField f{};
-        strcpy(f.BrokerID, config_.broker_id.c_str());
-        strcpy(f.InvestorID, config_.user_id.c_str());
-        LOG_DEBUG("[Gateway] ReqSettlementInfoConfirm");
-        trade_api_->ReqSettlementInfoConfirm(&f, 0);
-    });
-
-    std::thread([this]() {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        startQueries();
-    }).detach();
-}
-
-void FalconGateway::startQueries() {
-    LOG_INFO("[Gateway] Loading account, positions, instruments, commission rates...");
-    queryAccount();
-    queryPosition();
-    queryInstrument(config_.product_filter);
-    // Commission rates chained after instrument loading
-    flow_ctrl_.submit([this]() {
-        CThostFtdcQryInstrumentCommissionRateField f{};
-        strcpy(f.BrokerID, config_.broker_id.c_str());
-        strcpy(f.InvestorID, config_.user_id.c_str());
-        LOG_DEBUG("[Gateway] ReqQryInstrumentCommissionRate (all positions)");
-        trade_api_->ReqQryInstrumentCommissionRate(&f, 0);
-    });
-    // Broker trading params chained next (MarginPriceType)
-    flow_ctrl_.submit([this]() {
-        CThostFtdcQryBrokerTradingParamsField f{};
-        strcpy(f.BrokerID, config_.broker_id.c_str());
-        strcpy(f.InvestorID, config_.user_id.c_str());
-        strcpy(f.CurrencyID, "CNY");
-        LOG_DEBUG("[Gateway] ReqQryBrokerTradingParams");
-        trade_api_->ReqQryBrokerTradingParams(&f, 0);
-    });
-    // Trade history chained next
-    flow_ctrl_.submit([this]() {
-        CThostFtdcQryTradeField f{};
-        strcpy(f.BrokerID, config_.broker_id.c_str());
-        strcpy(f.InvestorID, config_.user_id.c_str());
-        LOG_DEBUG("[Gateway] ReqQryTrade (history)");
-        trade_api_->ReqQryTrade(&f, 0);
-    });
-
-    std::thread([this]() {
-        std::this_thread::sleep_for(std::chrono::seconds(6));
-        positions_loaded_ = true;
-        account_loaded_ = true;
-    }).detach();
-}
-
-void FalconGateway::checkReady() {
-    if (!ready_ && positions_loaded_ && account_loaded_) {
-        ready_ = true;
-        auto acc = position_mgr_.getAccount();
-        LOG_INFO("[Gateway] READY. TradingDay={} Instruments={} Balance={:.2f} Available={:.2f}",
-                 tradingDay(), instrument_count_, acc.balance, acc.available);
-        if (connected_cb_) connected_cb_();
+    // New trading day → previous day's trades no longer apply
+    auto day = tradingDay();
+    if (day != history_trading_day_) {
+        std::lock_guard lk(history_mtx_);
+        trade_history_.clear();
+        seen_trades_.clear();
+        history_trading_day_ = day;
     }
+
+    LOG_INFO("[Gateway] Loading account, positions, instruments, commission rates...");
+    submitQuery("ReqSettlementInfoConfirm", [this](int id) {
+        CThostFtdcSettlementInfoConfirmField f{};
+        (void)copyField(f.BrokerID, config_.broker_id);
+        (void)copyField(f.InvestorID, config_.user_id);
+        return trade_api_->ReqSettlementInfoConfirm(&f, id);
+    });
+    submitAccountQuery(false);
+    submitPositionQuery(false, true);
+    queryInstrument(config_.product_filter);
+    submitQuery("ReqQryInstrumentCommissionRate", [this](int id) {
+        CThostFtdcQryInstrumentCommissionRateField f{};
+        (void)copyField(f.BrokerID, config_.broker_id);
+        (void)copyField(f.InvestorID, config_.user_id);
+        return trade_api_->ReqQryInstrumentCommissionRate(&f, id);
+    });
+    submitQuery("ReqQryBrokerTradingParams", [this](int id) {
+        CThostFtdcQryBrokerTradingParamsField f{};
+        (void)copyField(f.BrokerID, config_.broker_id);
+        (void)copyField(f.InvestorID, config_.user_id);
+        (void)copyField(f.CurrencyID, "CNY");
+        return trade_api_->ReqQryBrokerTradingParams(&f, id);
+    });
+    submitTradeQuery(false);  // trade history
+    flow_ctrl_.submitMarker([this]() { startup_done_ = true; });
+}
+
+void FalconGateway::reconcileCommission() {
+    std::vector<TradeRecord> history = tradeHistory();
+    if (history.empty()) return;
+    double hist_comm = 0;
+    for (const auto& t : history) {
+        bool isOpen = (t.offset == Offset::Open);
+        hist_comm += position_mgr_.calcCommissionForOrder(t.instrument, t.price, t.volume, isOpen, false);
+    }
+    position_mgr_.setCommissionBaseline(hist_comm);
+    LOG_INFO("[Gateway] Commission baseline from {} trades: {:.2f}", history.size(), hist_comm);
+}
+
+void FalconGateway::onReady() {
+    reconcileCommission();
+    ready_ = true;
+    auto acc = position_mgr_.getAccount();
+    LOG_INFO("[Gateway] READY. TradingDay={} Instruments={} Balance={:.2f} Available={:.2f}",
+             tradingDay(), instrument_count_.load(), acc.balance, acc.available);
+    if (connected_cb_) connected_cb_();
 }
 
 // ============================================================
@@ -395,22 +463,35 @@ void FalconGateway::checkReady() {
 void FalconGateway::tradeWorkerLoop() {
     logger::preallocate();
     LOG_INFO("[TradeWorker] Started");
-    OrderRecord ord;
+    TraderEvent ev;
     TradeRecord trd;
     PositionRecord pos;
     AccountRecord acc;
 
     while (running_) {
         bool work = false;
+        // Read before draining: everything pushed before the marker fired is
+        // then guaranteed to be processed before READY.
+        bool startup_done = startup_done_.load();
 
         // --- Connection events ---
+        if (trader_handler_->front_disconnected.exchange(false)) {
+            LOG_WARN("[TradeWorker] Disconnected. Reason=0x{:04X}. Waiting for reconnect...",
+                     trader_handler_->disconnect_reason.load());
+            ready_ = false;
+            startup_done_ = false;
+            startup_done = false;
+            flow_ctrl_.reset();   // in-flight query is lost with the connection
+            work = true;
+        }
+
         if (trader_handler_->front_connected.exchange(false)) {
             LOG_INFO("[TradeWorker] Front connected. Authenticating...");
             CThostFtdcReqAuthenticateField a{};
-            strcpy(a.BrokerID, config_.broker_id.c_str());
-            strcpy(a.UserID, config_.user_id.c_str());
-            strcpy(a.AppID, config_.app_id.c_str());
-            strcpy(a.AuthCode, config_.auth_code.c_str());
+            (void)copyField(a.BrokerID, config_.broker_id);
+            (void)copyField(a.UserID, config_.user_id);
+            (void)copyField(a.AppID, config_.app_id);
+            (void)copyField(a.AuthCode, config_.auth_code);
             trade_api_->ReqAuthenticate(&a, 0);
             work = true;
         }
@@ -418,99 +499,54 @@ void FalconGateway::tradeWorkerLoop() {
         if (trader_handler_->authenticated.exchange(false)) {
             LOG_INFO("[TradeWorker] Authenticated. Logging in as {}...", config_.user_id);
             CThostFtdcReqUserLoginField l{};
-            strcpy(l.BrokerID, config_.broker_id.c_str());
-            strcpy(l.UserID, config_.user_id.c_str());
-            strcpy(l.Password, config_.password.c_str());
-            snprintf(l.UserProductInfo, sizeof(l.UserProductInfo), "%s", "FalconGW");
+            (void)copyField(l.BrokerID, config_.broker_id);
+            (void)copyField(l.UserID, config_.user_id);
+            (void)copyField(l.Password, config_.password);
+            (void)copyField(l.UserProductInfo, "FalconGW");
             trade_api_->ReqUserLogin(&l, 0);
             work = true;
         }
 
         if (trader_handler_->login_success.exchange(false)) {
             LOG_INFO("[TradeWorker] Login OK. FrontID={} SessionID={} TradingDay={}",
-                     trader_handler_->front_id, trader_handler_->session_id,
-                     trader_handler_->trading_day);
+                     trader_handler_->front_id.load(), trader_handler_->session_id.load(),
+                     tradingDay());
+            login_fail_reported_ = false;
             onLoginSuccess();
             if (login_cb_) login_cb_(true, "Login OK");
             work = true;
-        } else if (!trader_handler_->shouldRelogin() && !ready_) {
+        } else if (!trader_handler_->shouldRelogin() && !ready_ && !login_fail_reported_) {
             // Login permanently failed (wrong pw, illegal account, etc.)
-            static bool login_fail_reported = false;
-            if (!login_fail_reported) {
-                login_fail_reported = true;
-                LOG_CRITICAL("[TradeWorker] Login FAILED permanently. "
-                             "SimNow accounts may require password change via 快期 first.");
-                if (login_cb_) login_cb_(false, "Login failed: illegal login or wrong password");
-            }
+            login_fail_reported_ = true;
+            LOG_CRITICAL("[TradeWorker] Login FAILED permanently. "
+                         "SimNow accounts may require password change via 快期 first.");
+            if (login_cb_) login_cb_(false, "Login failed: illegal login or wrong password");
         }
 
-        if (trader_handler_->front_disconnected.exchange(false)) {
-            LOG_WARN("[TradeWorker] Disconnected. Reason=0x{:04X}",
-                     trader_handler_->disconnect_reason.load());
-            ready_ = false;
-        }
-
-        // --- Order updates ---
-        while (trader_handler_->order_updates.tryPop(ord)) {
-            processOrderUpdate(ord);
+        // --- Order/trade pushes (single queue preserves CTP ordering) ---
+        while (trader_handler_->events.tryPop(ev)) {
+            if (ev.kind == TraderEvent::Kind::Order) processOrderUpdate(ev.order);
+            else processTradeUpdate(ev.trade);
             work = true;
         }
 
-        // --- Trade updates ---
-        while (trader_handler_->trade_updates.tryPop(trd)) {
-            processTradeUpdate(trd);
-            work = true;
-        }
-
-        // --- Position query results ---
         while (trader_handler_->position_results.tryPop(pos)) {
             position_mgr_.onQueryPosition(pos);
             work = true;
         }
 
-        // --- Account query results ---
         while (trader_handler_->account_results.tryPop(acc)) {
             position_mgr_.onQueryAccount(acc);
             work = true;
         }
 
-
-        // --- Order query results (for comparison/verification) ---
-        while (trader_handler_->order_query_results.tryPop(ord)) {
-            remote_orders_.push_back(ord);
-            work = true;
-        }
-
-        // --- Trade query results ---
+        // Trade history: recorded for de-duplication, already in the snapshots
         while (trader_handler_->trade_query_results.tryPop(trd)) {
-            remote_trades_.push_back(trd);
-            // De-duplicate into trade_history_
-            bool dup = false;
-            for (const auto& t : trade_history_) {
-                if (std::string(t.trade_id.data()) == std::string(trd.trade_id.data())) { dup = true; break; }
-            }
-            if (!dup) trade_history_.push_back(trd);
+            recordTrade(trd);
             work = true;
         }
 
-        // Reconcile commission from loaded trade history
-        if (trade_history_.size() > 0 && account_loaded_) {
-            static bool reconciled = false;
-            if (!reconciled) {
-                double hist_comm = 0;
-                for (const auto& t : trade_history_) {
-                    bool isOpen = (t.offset == Offset::Open);
-                    hist_comm += position_mgr_.calcCommissionForOrder(
-                        t.instrument, t.price, t.volume, isOpen, false);
-                }
-                position_mgr_.setCommissionBaseline(hist_comm);
-                LOG_INFO("[Gateway] Commission baseline from {} trades: {:.2f}",
-                         trade_history_.size(), hist_comm);
-                reconciled = true;
-            }
-        }
-
-        checkReady();
+        if (startup_done && !ready_) onReady();
 
         if (!work) std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
@@ -527,27 +563,41 @@ void FalconGateway::mdWorkerLoop() {
     TickData tick;
 
     while (running_) {
+        bool work = false;
+
+        if (md_handler_->front_disconnected.exchange(false)) {
+            LOG_WARN("[MdWorker] Disconnected. Waiting for reconnect...");
+            work = true;
+        }
+
         if (md_handler_->front_connected.exchange(false)) {
             LOG_INFO("[MdWorker] Front connected. Logging in...");
             CThostFtdcReqUserLoginField l{};
-            strcpy(l.BrokerID, config_.broker_id.c_str());
-            strcpy(l.UserID, config_.user_id.c_str());
-            strcpy(l.Password, config_.password.c_str());
+            (void)copyField(l.BrokerID, config_.broker_id);
+            (void)copyField(l.UserID, config_.user_id);
+            (void)copyField(l.Password, config_.password);
             md_api_->ReqUserLogin(&l, 0);
+            work = true;
         }
 
         if (md_handler_->login_success.exchange(false)) {
-            if (!config_.subscribe_list.empty()) {
-                subscribe(config_.subscribe_list);
+            // Restore every subscription (initial login and reconnects)
+            std::vector<std::string> subs;
+            {
+                std::lock_guard lk(sub_mtx_);
+                subs.assign(subscribed_.begin(), subscribed_.end());
             }
-            LOG_INFO("[MdWorker] Market data login OK. Subscribed={}", config_.subscribe_list.size());
+            if (!subs.empty()) subscribe(subs);
+            LOG_INFO("[MdWorker] Market data login OK. Subscribed={}", subs.size());
+            work = true;
         }
 
         while (md_handler_->tick_buffer.tryPop(tick)) {
             processTick(tick);
+            work = true;
         }
 
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        if (!work) std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
     LOG_INFO("[MdWorker] Stopped");
 }
@@ -557,42 +607,46 @@ void FalconGateway::mdWorkerLoop() {
 // ============================================================
 
 void FalconGateway::processOrderUpdate(const OrderRecord& rec) {
-    auto result = order_mgr_.update(
-        rec.front_id, rec.session_id,
-        std::string(rec.order_ref.data()),
-        std::string(rec.order_sys_id.data()),
-        static_cast<char>(rec.status), rec.submit_status,
-        rec.volume_traded, rec.volume_total, "");
-
-    if (result.record && result.newly_final) {
-        if (result.is_cancel || result.is_exchange_reject) {
-            int unfilled = rec.volume_total;
-            if (unfilled == 0) unfilled = rec.request.volume - rec.volume_traded;
-            if (unfilled > 0) {
-                LOG_DEBUG("[Gateway] Order cancelled. inst={} ref={} sys_id={} unfilled={}",
-                          rec.request.instrument, rec.order_ref.data(),
-                          rec.order_sys_id.data(), unfilled);
-                position_mgr_.onOrderRejectOrCancel(rec.request, unfilled);
-            }
-        }
-    }
-
-    if (result.record) {
-        if (result.newly_final) {
-            LOG_INFO("[Gateway] Order final. inst={} ref={} status={} filled={}/{}",
-                     rec.request.instrument, rec.order_ref.data(),
-                     static_cast<char>(rec.status), rec.volume_traded, rec.request.volume);
-        }
-        if (order_cb_) order_cb_(*result.record);
-    } else {
+    auto result = order_mgr_.update(rec);
+    if (!result.found) {
         LOG_DEBUG("[Gateway] External order (not tracked). sys_id={}", rec.order_sys_id.data());
+        return;
     }
+    if (result.ignored) return;
+
+    const auto& ord = result.record;
+    if (result.newly_final) {
+        // Fills release their own share in onTradeFill; release the rest here
+        int unfilled = ord.request.volume - ord.volume_traded;
+        if (ord.status != OrderStatus::AllTraded && unfilled > 0) {
+            position_mgr_.releaseOrder(result.key, unfilled);
+        }
+        LOG_INFO("[Gateway] Order final. inst={} ref={} status={} submit={} filled={}/{}",
+                 ord.request.instrument, ord.order_ref.data(), static_cast<char>(ord.status),
+                 ord.submit_status, ord.volume_traded, ord.request.volume);
+    }
+    if (order_cb_) order_cb_(ord);
+}
+
+bool FalconGateway::recordTrade(const TradeRecord& rec) {
+    std::lock_guard lk(history_mtx_);
+    if (!seen_trades_.insert(rec.tradeKey()).second) return false;
+    trade_history_.push_back(rec);
+    return true;
 }
 
 void FalconGateway::processTradeUpdate(const TradeRecord& rec) {
-    position_mgr_.onTradeFill(rec);
-    // Add to local trade history
-    trade_history_.push_back(rec);
+    if (!recordTrade(rec)) {
+        LOG_DEBUG("[Gateway] Duplicate trade ignored. trade_id={}", rec.trade_id.data());
+        return;
+    }
+
+    auto key = order_mgr_.keyByOrderSysID(rec.exchange, rec.order_sys_id.data());
+    // Before READY only other sessions' trades (or private-topic replays) can
+    // arrive; the position/account snapshots already include them.
+    if (!key && !ready_) return;
+
+    position_mgr_.onTradeFill(rec, key.value_or(std::string{}));
     LOG_INFO("[Gateway] Trade fill. inst={} dir={} offset={} px={:.2f} vol={}",
              rec.instrument, static_cast<char>(rec.direction),
              static_cast<char>(rec.offset), rec.price, rec.volume);
@@ -605,87 +659,32 @@ void FalconGateway::processTick(const TickData& tick) {
 }
 
 // ============================================================
-// Instrument loading
+// Instrument loading (SPI thread)
 // ============================================================
 
-void FalconGateway::onInstrumentResponse(CThostFtdcInstrumentField* pInst, bool bIsLast) {
-    if (!pInst) {
-        if (bIsLast) {
-            instruments_loaded_ = true;
-            instrument_count_ = static_cast<int>(instruments_loaded_count_);
-            LOG_INFO("[Gateway] Instruments loaded: {} contracts", instrument_count_);
-            checkReady();
-        }
-        return;
+void FalconGateway::onInstrumentResponse(const InstrumentInfo* info, bool is_last) {
+    if (info) {
+        position_mgr_.addInstrument(*info);
+        int n = ++instruments_loaded_count_;
+        if (n % 100 == 0) LOG_DEBUG("[Gateway] Instruments progress: {} loaded...", n);
     }
-
-    InstrumentInfo info;
-    info.product_id = pInst->InstrumentID;
-    info.exchange_id = pInst->ExchangeID;
-    info.product_class = pInst->ProductClass;
-    info.volume_multiple = pInst->VolumeMultiple;
-    info.price_tick = pInst->PriceTick;
-    info.long_margin_ratio = pInst->LongMarginRatio;
-    info.short_margin_ratio = pInst->ShortMarginRatio;
-
-    if (info.long_margin_ratio > 1.0) info.long_margin_ratio /= 100.0;
-    if (info.short_margin_ratio > 1.0) info.short_margin_ratio /= 100.0;
-
-    info.position_date_type = pInst->PositionDateType;
-    info.max_margin_side = pInst->MaxMarginSideAlgorithm;
-    info.max_limit_order_volume = pInst->MaxLimitOrderVolume;
-    info.min_limit_order_volume = pInst->MinLimitOrderVolume;
-    info.max_market_order_volume = pInst->MaxMarketOrderVolume;
-    info.min_market_order_volume = pInst->MinMarketOrderVolume;
-    info.is_trading = pInst->IsTrading;
-    info.inst_life_phase = pInst->InstLifePhase;
-
-    if (info.isOption()) {
-        info.strike_price = pInst->StrikePrice;
-        info.options_type = pInst->OptionsType;
-        info.underlying_id = pInst->UnderlyingInstrID;
-        info.underlying_multiple = pInst->UnderlyingMultiple;
+    if (is_last) {
+        instrument_count_ = instruments_loaded_count_.exchange(0);
+        LOG_INFO("[Gateway] Instruments loaded: {} contracts", instrument_count_.load());
     }
-
-    position_mgr_.addInstrument(info);
-    instruments_loaded_count_++;
-
-    if (instruments_loaded_count_ % 100 == 0) {
-        LOG_DEBUG("[Gateway] Instruments progress: {} loaded...", instruments_loaded_count_);
-    }
-}
-
-int FalconGateway::cancelAllActive() {
-    int count = 0;
-    std::vector<std::tuple<std::string, std::string, std::string>> to_cancel;
-    order_mgr_.forEachActive([&](const OrderRecord& ord) {
-        std::string sys_id(ord.order_sys_id.data());
-        if (!sys_id.empty() && sys_id[0] != '\0') {
-            to_cancel.push_back({sys_id, ord.request.exchange, ord.request.instrument});
-        }
-    });
-    for (const auto& [sys_id, ex, inst] : to_cancel) {
-        int ret = cancelOrderBySysID(sys_id, ex, inst);
-        if (ret == 0) count++;
-    }
-    LOG_INFO("[Gateway] CancelAllActive: {}/{} orders cancelled", count, to_cancel.size());
-    return count;
 }
 
 void FalconGateway::verifyLocalState() {
-    // ---- Dump local order state ----
     LOG_INFO("========== ORDER STATE (local) ==========");
-    int active_count = 0;
-    order_mgr_.forEachActive([&](const OrderRecord& ord) {
-        active_count++;
+    auto active = order_mgr_.activeOrders();
+    for (const auto& ord : active) {
         LOG_INFO("[Local] inst={} ref={} sys_id={} status={} filled={}/{} total={}",
                  ord.request.instrument, ord.order_ref.data(), ord.order_sys_id.data(),
                  static_cast<char>(ord.status), ord.volume_traded,
                  ord.request.volume, ord.volume_total);
-    });
-    if (active_count == 0) LOG_INFO("[Local] No active orders.");
+    }
+    if (active.empty()) LOG_INFO("[Local] No active orders.");
 
-    // ---- Dump local account state ----
     LOG_INFO("========== ACCOUNT STATE (local) ==========");
     auto acc = position_mgr_.getAccount();
     LOG_INFO("[Local] Balance={:.2f} Available={:.2f} CurrMargin={:.2f} "
@@ -695,7 +694,6 @@ void FalconGateway::verifyLocalState() {
              acc.frozen_margin, acc.frozen_commission, acc.close_profit,
              acc.position_profit, acc.commission);
 
-    // ---- Dump local position state ----
     LOG_INFO("========== POSITION STATE (local) ==========");
     std::vector<PositionRecord> local_positions;
     position_mgr_.getAllPositions(local_positions);
@@ -715,44 +713,39 @@ void FalconGateway::verifyLocalState() {
     LOG_INFO("========== VERIFICATION COMPLETE ==========");
 }
 
-void FalconGateway::compareWithRemote() {
+void FalconGateway::compareWithRemote(int timeout_sec) {
     if (!ready_) { LOG_WARN("[Verify] Gateway not ready, skipping comparison"); return; }
 
     LOG_INFO("========== REMOTE COMPARISON ==========");
 
-    // Switch to verification mode (redirects SPI callbacks to cmp_* buffers)
-    trader_handler_->verify_mode = true;
-    trader_handler_->cmp_position_count = 0;
-    trader_handler_->cmp_account_count = 0;
-    trader_handler_->cmp_order_count = 0;
+    // Drain cmp buffers from any previous (timed-out) run
+    { PositionRecord d; while (trader_handler_->cmp_positions.tryPop(d)) {} }
+    { AccountRecord d;  while (trader_handler_->cmp_accounts.tryPop(d)) {} }
+    { OrderRecord d;    while (trader_handler_->cmp_orders.tryPop(d)) {} }
+    { TradeRecord d;    while (trader_handler_->cmp_trades.tryPop(d)) {} }
 
-    // Drain cmp buffers from any previous run
-    { PositionRecord dummy; while (trader_handler_->cmp_positions.tryPop(dummy)) {} }
-    { AccountRecord dummy;   while (trader_handler_->cmp_accounts.tryPop(dummy)) {} }
-    { OrderRecord dummy;     while (trader_handler_->cmp_orders.tryPop(dummy)) {} }
+    // Results are routed by request id, so concurrent normal queries are unaffected
+    auto done = std::make_shared<std::promise<void>>();
+    auto finished = done->get_future();
+    submitPositionQuery(true, false);
+    submitAccountQuery(true);
+    submitOrderQuery(true);
+    submitTradeQuery(true);
+    flow_ctrl_.submitMarker([done]() { done->set_value(); });
 
-    // Submit queries (flow_ctrl is idle at this point)
-    LOG_INFO("[Verify] Querying CTP for positions, account, orders...");
-    queryPosition();
-    queryAccount();
-    queryOrder();
+    if (finished.wait_for(std::chrono::seconds(timeout_sec)) != std::future_status::ready) {
+        LOG_WARN("[Verify] Remote queries did not complete within {}s, comparing partial data",
+                 timeout_sec);
+    }
 
-    // Wait for all queries to complete (flow_ctrl serializes, ~1s each)
-    std::this_thread::sleep_for(std::chrono::seconds(4));
-
-    // ---- Read remote data ----
     std::vector<PositionRecord> remote_positions;
     std::vector<AccountRecord>   remote_accounts;
     std::vector<OrderRecord>     remote_orders;
-
-    PositionRecord rp;
-    while (trader_handler_->cmp_positions.tryPop(rp)) remote_positions.push_back(rp);
-    AccountRecord ra;
-    while (trader_handler_->cmp_accounts.tryPop(ra)) remote_accounts.push_back(ra);
-    OrderRecord ro;
-    while (trader_handler_->cmp_orders.tryPop(ro))   remote_orders.push_back(ro);
-
-    trader_handler_->verify_mode = false;
+    std::vector<TradeRecord>     remote_trades;
+    { PositionRecord r; while (trader_handler_->cmp_positions.tryPop(r)) remote_positions.push_back(r); }
+    { AccountRecord r;  while (trader_handler_->cmp_accounts.tryPop(r)) remote_accounts.push_back(r); }
+    { OrderRecord r;    while (trader_handler_->cmp_orders.tryPop(r)) remote_orders.push_back(r); }
+    { TradeRecord r;    while (trader_handler_->cmp_trades.tryPop(r)) remote_trades.push_back(r); }
 
     // ---- Compare Account ----
     auto local_acc = position_mgr_.getAccount();
@@ -779,12 +772,12 @@ void FalconGateway::compareWithRemote() {
     }
 
     // ---- Compare Positions ----
-    LOG_INFO("[Compare] POSITION: local={} remote={}",
-             [&](){ std::vector<PositionRecord> v; position_mgr_.getAllPositions(v); return v.size(); }(),
-             remote_positions.size());
+    std::vector<PositionRecord> local_positions;
+    position_mgr_.getAllPositions(local_positions);
+    LOG_INFO("[Compare] POSITION: local={} remote={}", local_positions.size(), remote_positions.size());
 
     for (const auto& rp : remote_positions) {
-        auto* lp = position_mgr_.getPosition(rp.instrument, rp.posi_direction, rp.position_date);
+        auto lp = position_mgr_.getPosition(rp.instrument, rp.posi_direction, rp.position_date);
         if (lp) {
             bool ok = (lp->position == rp.position && lp->today_position == rp.today_position
                        && std::abs(lp->margin - rp.margin) < 0.02
@@ -802,9 +795,6 @@ void FalconGateway::compareWithRemote() {
                      rp.instrument, rp.posi_direction, rp.position_date, rp.position);
         }
     }
-    // Check for local-only positions
-    std::vector<PositionRecord> local_positions;
-    position_mgr_.getAllPositions(local_positions);
     for (const auto& lp : local_positions) {
         if (lp.position <= 0 && lp.frozen_margin <= 0 && lp.long_frozen <= 0 && lp.short_frozen <= 0) continue;
         bool found = false;
@@ -820,56 +810,47 @@ void FalconGateway::compareWithRemote() {
 
     // ---- Compare Orders ----
     LOG_INFO("[Compare] ORDER: local-active={} remote={}",
-             [&](){ int n=0; order_mgr_.forEachActive([&](auto&){ n++; }); return n; }(),
-             remote_orders.size());
+             order_mgr_.activeOrders().size(), remote_orders.size());
     for (const auto& ro : remote_orders) {
         std::string ref(ro.order_ref.data());
-        auto key = std::to_string(ro.front_id) + "_" + std::to_string(ro.session_id) + "_" + ref;
-        auto* lo = order_mgr_.findByOrderRef(key);
-        if (!lo && ro.order_sys_id[0] != '\0') lo = order_mgr_.findByOrderSysID(std::string(ro.order_sys_id.data()));
+        auto lo = order_mgr_.findByKey(OrderManager::makeKey(ro.front_id, ro.session_id, ref));
+        if (!lo && ro.order_sys_id[0] != '\0') {
+            lo = order_mgr_.findByOrderSysID(ro.request.exchange, ro.order_sys_id.data());
+        }
         if (lo) {
             bool ok = (lo->status == ro.status && lo->volume_traded == ro.volume_traded
                        && lo->volume_total == ro.volume_total);
             LOG_INFO("[Compare]   {} ref={} {} status={}({}) filled={}/{}({}/{})",
-                     ro.request.instrument, ref, ok?"OK":"!!",
+                     ro.request.instrument, ref, ok ? "OK" : "!!",
                      static_cast<char>(lo->status), static_cast<char>(ro.status),
                      lo->volume_traded, lo->request.volume,
                      ro.volume_traded, ro.volume_total);
         } else {
-            LOG_WARN("[Compare]   {} ref={} ONLY-REMOTE status={}",
-                     ro.request.instrument, ref, static_cast<char>(ro.status));
+            LOG_DEBUG("[Compare]   {} ref={} ONLY-REMOTE status={}",
+                      ro.request.instrument, ref, static_cast<char>(ro.status));
         }
     }
 
     // ---- Compare Trades ----
-    LOG_INFO("[Compare] TRADE: local-history={} remote={}",
-             trade_history_.size(), remote_trades_.size());
-    int t_ok = 0, t_extra = 0;
-    for (const auto& rt : remote_trades_) {
-        bool found = false;
-        for (const auto& lt : trade_history_) {
-            if (std::string(lt.trade_id.data()) == std::string(rt.trade_id.data())) {
-                found = true;
-                if (std::abs(lt.price - rt.price) < 0.01 && lt.volume == rt.volume) t_ok++;
-                break;
-            }
-        }
-        if (!found) t_extra++;
+    auto history = tradeHistory();
+    std::unordered_set<std::string> local_keys;
+    for (const auto& t : history) local_keys.insert(t.tradeKey());
+    int t_ok = 0, t_missing = 0;
+    for (const auto& rt : remote_trades) {
+        if (local_keys.count(rt.tradeKey())) t_ok++;
+        else t_missing++;
     }
-    LOG_INFO("[Compare] TRADE: {} matched, {} new-remote (not in local history)",
-             t_ok, t_extra);
+    LOG_INFO("[Compare] TRADE: local-history={} remote={} matched={} missing-locally={}",
+             history.size(), remote_trades.size(), t_ok, t_missing);
 
     // ---- Commission Reconciliation using trade history ----
     double total_comm = 0;
-    for (const auto& t : trade_history_) {
+    for (const auto& t : history) {
         bool isOpen = (t.offset == Offset::Open);
-        double comm = position_mgr_.calcCommissionForOrder(
-            t.instrument, t.price, t.volume, isOpen, false);
-        total_comm += comm;
+        total_comm += position_mgr_.calcCommissionForOrder(t.instrument, t.price, t.volume, isOpen, false);
     }
-    auto acc = position_mgr_.getAccount();
     LOG_INFO("[Compare] COMMISSION: local-tracked={:.2f} trade-history-calc={:.2f}",
-             acc.commission, total_comm);
+             position_mgr_.getAccount().commission, total_comm);
 
     LOG_INFO("========== COMPARISON COMPLETE ==========");
 }

@@ -1,3 +1,6 @@
 [submodule "external/quill"]
 	path = external/quill
 	url = https://github.com/odygrd/quill.git
+[submodule "external/json"]
+	path = external/json
+	url = https://github.com/nlohmann/json.git

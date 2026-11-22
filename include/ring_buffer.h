@@ -1,50 +1,54 @@
 #pragma once
 #include <atomic>
+#include <cstddef>
+#include <utility>
 #include <vector>
-#include <memory>
-#include <new>
-#include <cstring>
 
 namespace falcon {
 
 // Lock-free SPSC Ring Buffer
 // Single producer (CTP SPI thread), Single consumer (worker thread)
+//
+// Slots are default-constructed once and reused via assignment, so element
+// lifetimes are always managed by the vector (safe for types holding
+// std::string etc.). One slot is kept empty to distinguish full from empty,
+// so the usable capacity is Capacity - 1.
 template<typename T, size_t Capacity = 65536>
 class RingBuffer {
-    static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be power of 2");
+    static_assert(Capacity >= 2 && (Capacity & (Capacity - 1)) == 0,
+                  "Capacity must be a power of 2");
 
     static constexpr size_t kMask = Capacity - 1;
 
     alignas(64) std::atomic<size_t> write_pos_{0};
     alignas(64) std::atomic<size_t> read_pos_{0};
-    alignas(64) std::vector<T> buffer_{Capacity};
+    alignas(64) std::vector<T> buffer_ = std::vector<T>(Capacity);
 
 public:
     RingBuffer() = default;
+    RingBuffer(const RingBuffer&) = delete;
+    RingBuffer& operator=(const RingBuffer&) = delete;
 
-    // Producer: CTP SPI thread calls this
-    template<typename... Args>
-    bool tryPush(Args&&... args) {
+    static constexpr size_t capacity() { return Capacity - 1; }
+
+    // Producer only. Arguments are left untouched when the buffer is full.
+    template<typename U>
+    bool tryPush(U&& value) {
         size_t w = write_pos_.load(std::memory_order_relaxed);
-        size_t r = read_pos_.load(std::memory_order_acquire);
         size_t next = (w + 1) & kMask;
+        if (next == read_pos_.load(std::memory_order_acquire)) return false;  // Full
 
-        if (next == r) return false;  // Full
-
-        ::new (&buffer_[w]) T(std::forward<Args>(args)...);
+        buffer_[w] = std::forward<U>(value);
         write_pos_.store(next, std::memory_order_release);
         return true;
     }
 
-    // Consumer: worker thread calls this
+    // Consumer only.
     bool tryPop(T& out) {
         size_t r = read_pos_.load(std::memory_order_relaxed);
-        size_t w = write_pos_.load(std::memory_order_acquire);
-
-        if (r == w) return false;  // Empty
+        if (r == write_pos_.load(std::memory_order_acquire)) return false;  // Empty
 
         out = std::move(buffer_[r]);
-        buffer_[r].~T();
         read_pos_.store((r + 1) & kMask, std::memory_order_release);
         return true;
     }
@@ -52,35 +56,6 @@ public:
     [[nodiscard]] bool empty() const {
         return read_pos_.load(std::memory_order_acquire)
             == write_pos_.load(std::memory_order_acquire);
-    }
-};
-
-// Fixed-size pre-allocated buffer for callbacks (avoids heap alloc in SPI thread)
-// Suitable for types that are trivially copyable and small
-template<typename T, size_t Capacity = 1024>
-class FixedQueue {
-    static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be power of 2");
-    static constexpr size_t kMask = Capacity - 1;
-
-    alignas(64) std::atomic<size_t> write_{0};
-    alignas(64) size_t read_{0};  // Only consumer accesses
-    std::vector<T> buffer_{Capacity};
-
-public:
-    bool tryPush(const T& item) {
-        size_t w = write_.load(std::memory_order_relaxed);
-        size_t next = (w + 1) & kMask;
-        if (next == read_) return false;
-        buffer_[w] = item;
-        write_.store(next, std::memory_order_release);
-        return true;
-    }
-
-    bool tryPop(T& out) {
-        if (read_ == write_.load(std::memory_order_acquire)) return false;
-        out = buffer_[read_];
-        read_ = (read_ + 1) & kMask;
-        return true;
     }
 };
 

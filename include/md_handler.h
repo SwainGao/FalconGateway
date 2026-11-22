@@ -1,31 +1,26 @@
 #pragma once
 #include <atomic>
-#include <functional>
-#include <string>
-#include <unordered_set>
-#include "ctp/ThostFtdcMdApi.h"
+#include "ctp_api.h"
 #include "ring_buffer.h"
 #include "types.h"
 
 namespace falcon {
 
 // Market Data SPI: receives CTP callbacks, pushes ticks to ring buffer.
-class MdHandler : public CThostFtdcMdSpi {
+// Ticks are dropped (and counted) when the buffer is full.
+class MdHandler final : public CThostFtdcMdSpi {
 public:
     RingBuffer<TickData, 65536> tick_buffer;
 
     std::atomic<bool> front_connected{false};
+    std::atomic<bool> front_disconnected{false};
     std::atomic<bool> login_success{false};
+    std::atomic<long> dropped_ticks{0};
 
-    // Newly discovered instruments (from OnRtnDepthMarketData)
-    std::unordered_set<std::string> active_instruments;
-
-private:
-    std::atomic<bool> need_relogin_{true};
-
-public:
     MdHandler() = default;
     ~MdHandler() = default;
+
+    void resetState();
 
     void OnFrontConnected() override;
     void OnFrontDisconnected(int nReason) override;
@@ -35,8 +30,6 @@ public:
     void OnRspSubMarketData(CThostFtdcSpecificInstrumentField* pSpecificInstrument,
                              CThostFtdcRspInfoField* pRspInfo, int nRequestID, bool bIsLast) override;
     void OnRspError(CThostFtdcRspInfoField* pRspInfo, int nRequestID, bool bIsLast) override;
-
-    bool shouldRelogin() const { return need_relogin_; }
 };
 
 } // namespace falcon
